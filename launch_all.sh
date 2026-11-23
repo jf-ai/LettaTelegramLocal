@@ -2,13 +2,17 @@
 # Launch Telegram bridges for multiple agents.
 #
 # Usage:
-#   ./launch_all.sh              # Launch all agents (Opus, Sonnet, Haiku)
-#   ./launch_all.sh Opus Sonnet  # Launch specific agents only
+#   ./launch_all.sh                          # Launch all agents (Opus, Sonnet, Haiku, model_test_agent)
+#   ./launch_all.sh Opus Sonnet              # Launch specific agents only
 #
 # Each agent needs its own bot token in the .env file:
 #   TELEGRAM_BOT_TOKEN_OPUS=...
 #   TELEGRAM_BOT_TOKEN_SONNET=...
 #   TELEGRAM_BOT_TOKEN_HAIKU=...
+#   TELEGRAM_BOT_TOKEN_MODEL_TEST_AGENT=...
+#
+# The agent name must match its record on the Agent Home server exactly (the bridge
+# resolves it via /agents/by-name/{name}, case-sensitive).
 #
 # Common settings (AUTHORIZED_USER, TELEGRAM_PASSWORD, etc.) are shared.
 
@@ -21,7 +25,7 @@ cd "$SCRIPT_DIR"
 source .env
 
 # Default: all agents
-DEFAULT_AGENTS=("Opus" "Sonnet" "Haiku")
+DEFAULT_AGENTS=("Opus" "Sonnet" "Haiku" "model_test_agent")
 
 # Use command line args if provided, otherwise default
 if [ $# -gt 0 ]; then
