@@ -25,7 +25,7 @@ cd "$SCRIPT_DIR"
 source .env
 
 # Default: all agents
-DEFAULT_AGENTS=("Opus" "Sonnet" "Haiku" "model_test_agent")
+DEFAULT_AGENTS=("Opus" "Sonnet" "Haiku" "model_eval_agent")
 
 # Use command line args if provided, otherwise default
 if [ $# -gt 0 ]; then
