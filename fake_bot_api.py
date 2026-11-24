@@ -1,11 +1,11 @@
 """A fake Telegram Bot API — for exercising the bridge without Telegram or real tokens.
 
-Point the bridge at it with TELEGRAM_API_BASE_URL=http://127.0.0.1:8900/bot. It implements
-just enough of the Bot API for python-telegram-bot's long-polling loop, records everything
-the bot sends, and lets a test inject updates as if the authorized user had typed them.
+Run the bridge against it with run_against_fake_api.py. It implements just enough of the
+Bot API for python-telegram-bot's long-polling loop, records everything the bot sends, and
+lets a test inject updates as if the authorized user had typed them.
 
-    uv run uvicorn fake_bot_api:app --port 8900
-    curl -X POST 'localhost:8900/inject?text=/stream_on'
+    uv run --with fastapi --with uvicorn uvicorn fake_bot_api:app --port 8900
+    curl -X POST 'localhost:8900/inject?text=/background_stream%20on'
     curl -s localhost:8900/sent | python -m json.tool
 
 Not part of the bridge: no auth, no persistence, in-memory only.

@@ -54,8 +54,6 @@ else:
     raise Exception("invalid value for SKIP_FIRST_PING")
 
 SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8000")
-# Testing hook: run the whole bridge against a fake Bot API (mock tokens, no Telegram).
-TELEGRAM_API_BASE_URL = os.getenv("TELEGRAM_API_BASE_URL")
 
 ALLOWED_USER_IDS = [int(AUTHORIZED_USER)]
 
@@ -638,13 +636,10 @@ def build_application(state: BridgeState) -> Application:
     Separated from main() so the handler wiring (and its auth gating) can be asserted
     without starting a bot.
     """
-    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
-    if TELEGRAM_API_BASE_URL:
-        builder = builder.base_url(TELEGRAM_API_BASE_URL)  # testing hook: fake Bot API
     # Concurrent updates are required, not cosmetic: a turn can hold for minutes while the
     # agent works, and /cancel and /stream_off are only useful if they land *during* it.
     # With the default (one update at a time) they would queue until the run finished.
-    app = builder.concurrent_updates(True).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     # Each list is registered for what it is: the entry point as-is, everything else
     # wrapped. Nothing here decides gating — the declaration already did.
