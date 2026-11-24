@@ -23,8 +23,16 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ChatType
 from telegram.error import TelegramError
-from telegram.ext import Application, MessageHandler, CommandHandler, filters
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CommandHandler,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
 
 from agent_home_client import (
     AgentStreamError,
@@ -426,6 +434,31 @@ async def handle_message(update: Update, context, state: BridgeState):
         else:
             await update.message.reply_text(f"Error: {detail}")
 
+async def _admit_private_chat_from_known_user(update: Update, context) -> None:
+    """Outer filter, run before every handler: only new messages, from the known user, in
+    a private chat, get any further.
+
+    Everything else stops here — strangers, groups (where replies and the background
+    stream would land in front of other members), channel posts, edits, membership
+    changes. Each drop is logged to the host so probing is visible; nothing is sent back.
+    Message text is never logged: a /start typed into the wrong chat carries the password.
+    """
+    user, chat = update.effective_user, update.effective_chat
+    if (
+        update.message is not None
+        and user is not None
+        and is_known_user(user.id)
+        and chat.type == ChatType.PRIVATE
+    ):
+        return
+
+    kind = next((kind for kind in Update.ALL_TYPES if getattr(update, kind, None) is not None), "unknown")
+    sender = f"user {user.id} {user.username!r}" if user else "no user"
+    where = f"{chat.type} chat {chat.id}" if chat else "no chat"
+    print(f"[{AGENT_NAME}] Dropped {kind} from {sender} in {where}")
+    raise ApplicationHandlerStop
+
+
 def _with_state(handler, state: BridgeState):
     """Inject BridgeState as the handler's third argument at registration.
 
@@ -629,6 +662,9 @@ AUTH_GATED_CMDS: tuple[BridgeCommand, ...] = (
 
 COMMANDS: tuple[BridgeCommand, ...] = (START_CMD,) + AUTH_GATED_CMDS
 
+# Handler group for _admit_private_chat_from_known_user; below the default group 0.
+OUTER_FILTER_GROUP = -1
+
 
 def build_application(state: BridgeState) -> Application:
     """Build the Application and register handlers — no polling, no agent lookup.
@@ -640,6 +676,10 @@ def build_application(state: BridgeState) -> Application:
     # agent works, and /cancel and /stream_off are only useful if they land *during* it.
     # With the default (one update at a time) they would queue until the run finished.
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
+
+    # The lowest group runs first, and the filter's ApplicationHandlerStop ends processing
+    # there — so no handler below ever sees an update it rejects.
+    app.add_handler(TypeHandler(Update, _admit_private_chat_from_known_user), group=OUTER_FILTER_GROUP)
 
     # Each list is registered for what it is: the entry point as-is, everything else
     # wrapped. Nothing here decides gating — the declaration already did.

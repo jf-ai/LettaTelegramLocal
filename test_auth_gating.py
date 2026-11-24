@@ -8,6 +8,7 @@ fails the suite rather than quietly relying on a reviewer.
 """
 import asyncio
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 # Config is read at import time; point at a name with no token in .env so no real
@@ -19,7 +20,8 @@ os.environ.setdefault("SKIP_FIRST_PING", "True")
 os.environ.setdefault("TELEGRAM_PASSWORD", "correct-horse")
 
 import pytest  # noqa: E402
-from telegram.ext import CommandHandler  # noqa: E402
+from telegram import Chat, Message, Update, User  # noqa: E402
+from telegram.ext import ApplicationHandlerStop, CommandHandler, TypeHandler  # noqa: E402
 
 import LettaTelegramLocal as bridge  # noqa: E402  (must follow the env setup)
 
@@ -60,6 +62,7 @@ def test_every_handler_except_start_is_gated():
     }
 
     assert gated == {
+        "_admit_private_chat_from_known_user": False,  # the outer filter, ahead of everything
         "start": False,            # the way in — it cannot sit behind the gate
         "help_cmd": True,
         "set_verbose": True,
@@ -114,6 +117,57 @@ class TestGateBehaviour:
 
         assert calls == ["ran"]
         assert update.message.replies == []
+
+
+def _telegram_update(user_id: int | None, chat_type: str = "private", kind: str = "message") -> Update:
+    """A real Update — the outer filter reads its derived fields (effective_user, ...)."""
+    user = User(id=user_id, first_name="T", is_bot=False, username="probe") if user_id else None
+    chat = Chat(id=user_id or -100, type=chat_type)
+    message = Message(message_id=1, date=datetime.now(timezone.utc), chat=chat, from_user=user, text="/start secret")
+    return Update(update_id=1, **{kind: message})
+
+
+class TestOuterFilter:
+    """Before any handler runs, everything but a new private message from the known user
+    is dropped — and logged, without its text."""
+
+    KNOWN = bridge.ALLOWED_USER_IDS[0]
+
+    def _admitted(self, update: Update) -> bool:
+        try:
+            asyncio.run(bridge._admit_private_chat_from_known_user(update, None))
+        except ApplicationHandlerStop:
+            return False
+        return True
+
+    def test_registered_ahead_of_every_other_handler(self):
+        app = bridge.build_application(_state())
+
+        first_group = min(app.handlers)
+        assert first_group == bridge.OUTER_FILTER_GROUP < 0
+        [outer] = app.handlers[first_group]
+        assert isinstance(outer, TypeHandler) and outer.type is Update
+        assert outer.callback is bridge._admit_private_chat_from_known_user
+
+    def test_private_message_from_known_user_is_admitted(self):
+        assert self._admitted(_telegram_update(self.KNOWN))
+
+    @pytest.mark.parametrize("update", [
+        pytest.param(_telegram_update(999), id="stranger"),
+        pytest.param(_telegram_update(KNOWN, chat_type="group"), id="known-user-in-group"),
+        pytest.param(_telegram_update(KNOWN, chat_type="supergroup"), id="known-user-in-supergroup"),
+        pytest.param(_telegram_update(KNOWN, kind="edited_message"), id="edited-message"),
+        pytest.param(_telegram_update(None, chat_type="channel", kind="channel_post"), id="channel-post"),
+    ])
+    def test_everything_else_is_dropped(self, update):
+        assert not self._admitted(update)
+
+    def test_drop_is_logged_without_the_message_text(self, capsys):
+        self._admitted(_telegram_update(self.KNOWN, chat_type="group"))
+
+        log = capsys.readouterr().out
+        assert f"Dropped message from user {self.KNOWN} 'probe' in group chat {self.KNOWN}" in log
+        assert "secret" not in log
 
 
 class _FakeBot:
