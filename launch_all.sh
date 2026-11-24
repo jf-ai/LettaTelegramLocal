@@ -2,14 +2,14 @@
 # Launch Telegram bridges for multiple agents.
 #
 # Usage:
-#   ./launch_all.sh                          # Launch all agents (Opus, Sonnet, Haiku, model_test_agent)
+#   ./launch_all.sh                          # Launch all agents (Opus, Sonnet, Haiku, model_eval_agent)
 #   ./launch_all.sh Opus Sonnet              # Launch specific agents only
 #
 # Each agent needs its own bot token in the .env file:
 #   TELEGRAM_BOT_TOKEN_OPUS=...
 #   TELEGRAM_BOT_TOKEN_SONNET=...
 #   TELEGRAM_BOT_TOKEN_HAIKU=...
-#   TELEGRAM_BOT_TOKEN_MODEL_TEST_AGENT=...
+#   TELEGRAM_BOT_TOKEN_MODEL_EVAL_AGENT=...
 #
 # The agent name must match its record on the Agent Home server exactly (the bridge
 # resolves it via /agents/by-name/{name}, case-sensitive).
@@ -24,8 +24,16 @@ cd "$SCRIPT_DIR"
 # Load .env to get the bot tokens
 source .env
 
-# Default: all agents
-DEFAULT_AGENTS=("Opus" "Sonnet" "Haiku" "model_eval_agent")
+# Default: names from agents.json when it exists, else the built-in list
+if [ -f agents.json ]; then
+    mapfile -t DEFAULT_AGENTS < <(uv run python registry.py)
+    if [ ${#DEFAULT_AGENTS[@]} -eq 0 ]; then
+        echo "agents.json exists but lists no agents — nothing to launch." >&2
+        exit 1
+    fi
+else
+    DEFAULT_AGENTS=("Opus" "Sonnet" "Haiku" "model_eval_agent")
+fi
 
 # Use command line args if provided, otherwise default
 if [ $# -gt 0 ]; then
