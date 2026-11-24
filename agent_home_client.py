@@ -140,6 +140,27 @@ def send_message_sync(server_url: str, agent_id: str, message: str,
     return acc.text()
 
 
+async def cancel_agent_run_async(server_url: str, agent_id: str) -> bool:
+    """Ask the server to cancel the agent's in-flight run. True if a cancel was accepted.
+
+    Cancels whichever run is active for that agent — including one started by another
+    client (the TUI), not just this bridge's. 409 means nothing was running. Note the
+    server's cancellation is cooperative: it is serviced between streamed events, so a
+    request that is hung before producing output cannot be interrupted promptly.
+    """
+    url = f"{server_url}/agents/{agent_id}/cancel"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url)
+    except httpx.HTTPError as e:
+        raise AgentStreamError(f"Cancel request failed: {e}") from e
+    if resp.status_code == 202:
+        return True
+    if resp.status_code == 409:
+        return False
+    raise AgentStreamError(f"Cancel rejected: HTTP {resp.status_code}: {resp.text[:200]}")
+
+
 def resolve_agent_id_by_name_sync(server_url: str, agent_name: str) -> str:
     """Look up an agent ID by name from the Agent Home registry."""
     try:

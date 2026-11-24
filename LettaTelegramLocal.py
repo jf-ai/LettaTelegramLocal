@@ -25,16 +25,20 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
 from agent_home_client import (
     AgentStreamError,
+    cancel_agent_run_async,
     resolve_agent_id_by_name_async,
     send_message_async,
 )
+from registry import resolve_bot_token
+from stream_relay import StreamRelay
 
 load_dotenv()
 
 # Config
 AGENT_NAME = os.getenv("AGENT_NAME", "Opus")
-# Try agent-specific token first, fall back to generic
-TELEGRAM_BOT_TOKEN = os.getenv(f"TELEGRAM_BOT_TOKEN_{AGENT_NAME.upper()}") or os.getenv("TELEGRAM_BOT_TOKEN")
+# From agents.json, falling back to TELEGRAM_BOT_TOKEN_<NAME> / TELEGRAM_BOT_TOKEN.
+# Fails loudly at startup when neither source has a token for this agent.
+TELEGRAM_BOT_TOKEN = resolve_bot_token(AGENT_NAME)
 AUTHORIZED_USER = os.getenv("AUTHORIZED_USER")
 TELEGRAM_PASSWORD = os.getenv("TELEGRAM_PASSWORD")
 SKIP_FIRST_PING = os.getenv("SKIP_FIRST_PING")
@@ -46,6 +50,8 @@ else:
     raise Exception("invalid value for SKIP_FIRST_PING")
 
 SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8000")
+# Testing hook: run the whole bridge against a fake Bot API (mock tokens, no Telegram).
+TELEGRAM_API_BASE_URL = os.getenv("TELEGRAM_API_BASE_URL")
 
 ALLOWED_USER_IDS = [int(AUTHORIZED_USER)]
 
@@ -53,6 +59,8 @@ ALLOWED_USER_IDS = [int(AUTHORIZED_USER)]
 MESSAGE_TIMEOUT_SECONDS = 480  # agent runs can be long (agentic tool use)
 ALERT_TIMEOUT_SECONDS = 120   # alerts: best-effort, don't block callers as long
 AGENT_ID = None               # resolved at startup from the agent registry
+bridge_run_active = False     # True while this bridge's own turn is in flight
+stream_relay: StreamRelay | None = None   # background relay started by /stream_on
 
 # Session state (clears on restart)
 authenticated_users = set()
@@ -189,7 +197,12 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
     async def on_text_delta(buffer: str) -> None:
         await tag_sender.scan(buffer)
 
+    global bridge_run_active
     try:
+        # Mark our own run: /stream_on relays *other* clients' runs, and this turn is
+        # already being delivered through the tag path — relaying it too would duplicate
+        # every line on the phone.
+        bridge_run_active = True
         text = await send_message_async(
             SERVER_URL, AGENT_ID, message, MESSAGE_TIMEOUT_SECONDS,
             on_text_delta=on_text_delta if tag_sender else None,
@@ -201,6 +214,8 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
         }
     except AgentStreamError as e:
         return {"success": False, "result": str(e), "updates_sent": 0}
+    finally:
+        bridge_run_active = False
 
 
 async def send_alert_to_opus(message: str):
@@ -393,6 +408,96 @@ async def handle_message(update: Update, context):
     else:
         await update.message.reply_text(f"Error: {result['result']}")
 
+async def send_chat_text(bot, chat_id: int, text: str) -> None:
+    """Send bridge-authored text to a chat, respecting Telegram's per-message limit."""
+    for chunk in _chunk(text, TELEGRAM_CHUNK_LIMIT):
+        await bot.send_message(chat_id=chat_id, text=chunk)
+
+
+async def _require_authenticated(update: Update) -> bool:
+    """Shared gate for handlers: authorized user AND completed /start.
+
+    Unauthorized users are dropped silently (no reply, no information); known users who
+    haven't authenticated are told how.
+    """
+    user_id = update.effective_user.id
+    if not is_authorized_user(user_id):
+        return False
+    if user_id not in authenticated_users:
+        await update.message.reply_text("Please connect first with /start")
+        return False
+    return True
+
+
+async def stream_on(update: Update, context):
+    """Watch this agent's background runs. /stream_on [minutes] — endless by default.
+
+    "Background" means runs this bridge didn't start: a TUI session, another client.
+    Runs started through Telegram are already delivered through the tag path and are
+    suppressed in the relay to avoid duplicate messages.
+    """
+    global stream_relay
+    if not await _require_authenticated(update):
+        return
+
+    minutes: float | None = None
+    if context.args:
+        try:
+            minutes = float(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Usage: /stream_on [minutes] — with no argument it streams until /stream_off")
+            return
+        if minutes <= 0:
+            await update.message.reply_text("Minutes must be greater than zero.")
+            return
+
+    if stream_relay is not None and stream_relay.is_running:
+        await update.message.reply_text(f"Already streaming ({stream_relay.status()}). /stream_off to stop.")
+        return
+
+    chat_id = update.message.chat_id
+    stream_relay = StreamRelay(
+        SERVER_URL,
+        AGENT_ID,
+        send=lambda text: send_chat_text(context.bot, chat_id, text),
+        suppress=lambda: bridge_run_active,
+    )
+    stream_relay.start(minutes)
+
+    where = "endless until /stream_off" if minutes is None else f"{minutes:g} min"
+    await update.message.reply_text(f"Streaming background runs ({where}).")
+
+
+async def stream_off(update: Update, context):
+    """Stop the background relay. The agent's run keeps going."""
+    if not await _require_authenticated(update):
+        return
+    if stream_relay is None or not stream_relay.is_running:
+        await update.message.reply_text("No stream is running.")
+        return
+    await stream_relay.stop("stream off (the run keeps going)")
+
+
+async def cancel_run(update: Update, context):
+    """Interject: cancel the agent's in-flight run — including one started elsewhere.
+
+    The bridge holds its own turn open for up to MESSAGE_TIMEOUT_SECONDS, so updates are
+    processed concurrently (see main); otherwise this command could not land mid-run,
+    which is the only time it is useful.
+    """
+    if not await _require_authenticated(update):
+        return
+    try:
+        accepted = await cancel_agent_run_async(SERVER_URL, AGENT_ID)
+    except AgentStreamError as e:
+        await update.message.reply_text(f"Cancel failed: {e}")
+        return
+    if accepted:
+        await update.message.reply_text("Cancel requested — it lands between streamed events, not mid-request.")
+    else:
+        await update.message.reply_text("No run is active.")
+
+
 async def start(update: Update, context):
     user_id = update.effective_user.id
 
@@ -429,8 +534,17 @@ def main():
     AGENT_ID = asyncio.run(resolve_agent_id_by_name_async(SERVER_URL, AGENT_NAME))
     print(f"[{AGENT_NAME}] Connected to agent ({AGENT_ID}) at {SERVER_URL}")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    if TELEGRAM_API_BASE_URL:
+        builder = builder.base_url(TELEGRAM_API_BASE_URL)  # testing hook: fake Bot API
+    # Concurrent updates are required, not cosmetic: a turn can hold for minutes while the
+    # agent works, and /cancel and /stream_off are only useful if they land *during* it.
+    # With the default (one update at a time) they would queue until the run finished.
+    app = builder.concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stream_on", stream_on))
+    app.add_handler(CommandHandler("stream_off", stream_off))
+    app.add_handler(CommandHandler("cancel", cancel_run))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Schedule the periodic ping using JobQueue (if enabled)
