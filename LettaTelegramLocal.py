@@ -226,27 +226,19 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
         bridge_run_active = False
 
 
-async def shutdown_after_failed_attempts(context, attempts: int) -> None:
+def shutdown_after_failed_attempts(context, attempts: int) -> None:
     """Take the bridge down after repeated wrong passwords from the authorized account.
 
-    This cannot be tripped by a stranger: /start returns before this branch unless the
-    sender already *is* the authorized user. So repeated failure means the account is in
-    someone else's hands (or the operator is guessing badly), and down is the safe state —
-    restarting becomes a deliberate act.
+    Cannot be tripped by a stranger: /start returns before this branch unless the sender
+    already *is* the authorized user. So repeated failure means the account is in someone
+    else's hands — down is the safe state, and restarting becomes a deliberate act.
 
-    The notice goes to int(AUTHORIZED_USER) from configuration, never to a chat id taken
-    from the attempt that triggered it: an address supplied by the event is an address the
-    attacker controls, and this message is about them.
+    Deliberately silent in Telegram. Every address available here belongs to that same
+    account (chat_id == user_id in a private chat), so a notice would be read by whoever
+    is holding it — the response itself would be the leak. The reason goes to the host log
+    instead; the operator notices the silence and the log explains it.
     """
     print(f"[{AGENT_NAME}] {attempts} failed authentication attempts — shutting down Telegram bridge")
-    try:
-        await context.bot.send_message(
-            chat_id=int(AUTHORIZED_USER),
-            text=(f"[SECURITY] {attempts} failed /start attempts on this bridge. "
-                  "Shutting down — restart manually when safe."),
-        )
-    except TelegramError as e:
-        print(f"[{AGENT_NAME}] Shutdown notice failed to send: {e}")
     context.application.stop_running()
 
 
@@ -581,7 +573,7 @@ async def start(update: Update, context):
             failed_auth_attempts += 1
             await send_alert_to_opus(f"[SECURITY ALERT via Telegram] Failed authentication attempt from user ID: {user_id}")
             if failed_auth_attempts >= MAX_FAILED_AUTH_ATTEMPTS:
-                await shutdown_after_failed_attempts(context, failed_auth_attempts)
+                shutdown_after_failed_attempts(context, failed_auth_attempts)
         await update.message.reply_text("Hmm, I don't understand. Please try again?")
         return
 

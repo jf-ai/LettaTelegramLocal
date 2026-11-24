@@ -159,23 +159,25 @@ class TestFailedAttemptTripwire:
 
         assert update.application.stopped == 0
 
-    def test_fifth_failure_stops_the_bridge_and_says_why(self):
+    def test_fifth_failure_stops_the_bridge(self):
         update = self._fail(5)
 
         assert update.application.stopped == 1
-        chat_id, text = update.bot.sent[-1]
-        assert chat_id == int(bridge.AUTHORIZED_USER)
-        assert text == "[SECURITY] 5 failed /start attempts on this bridge. Shutting down — restart manually when safe."
 
-    def test_notice_never_goes_to_the_chat_that_triggered_it(self):
-        """The whole point: a notice about an attacker must not be addressed from the
-        attacker's own message, or it is delivered to them."""
-        attacker_chat = 999_999
-        update = self._fail(5, chat_id=attacker_chat)
+    def test_shutdown_sends_nothing_to_telegram(self):
+        """Every address available belongs to the account that just failed, so a notice
+        would be a response to whoever holds it. Silence; the host log carries the reason."""
+        update = self._fail(5)
 
-        addressed = [chat_id for chat_id, _ in update.bot.sent]
+        assert update.bot.sent == []
 
-        assert attacker_chat not in addressed
+    def test_fifth_attempt_is_indistinguishable_from_an_ordinary_failure(self):
+        """The vague reply must not change on the trip, or the attacker learns the
+        threshold was reached."""
+        self._fail(4)
+        update = self._send_wrong_password()
+
+        assert update.message.replies == ["Hmm, I don't understand. Please try again?"]
 
     def test_successful_auth_resets_the_count(self):
         self._fail(4)
