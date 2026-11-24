@@ -19,7 +19,7 @@ import functools
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -63,20 +63,34 @@ ALLOWED_USER_IDS = [int(AUTHORIZED_USER)]
 MESSAGE_TIMEOUT_SECONDS = 480  # agent runs can be long (agentic tool use)
 ALERT_TIMEOUT_SECONDS = 120   # alerts: best-effort, don't block callers as long
 MAX_FAILED_AUTH_ATTEMPTS = 5  # tripwire, not a rate limit — see start()
-AGENT_ID = None               # resolved at startup from the agent registry
-bridge_run_active = False     # True while this bridge's own turn is in flight.
-# Read by StreamRelay.suppress to keep our own turn out of the background relay; see the
-# TODO in stream_relay.StreamRelay for why this is client-side rather than the server's
-# Suppress-Broadcast header.
-user_turn_active = False      # True while handle_message is running a chat turn
-stream_relay: StreamRelay | None = None   # background relay started by /background_stream
-verbose_mode = OutputMode.TAGS            # what a run looks like in chat; see output_policy
 
-# Session state (clears on restart)
-authenticated_users = set()
-failed_auth_attempts = 0  # consecutive wrong passwords this session; only the authorized
-                          # account can raise it (is_known_user gates /start first)
-briefed_users = set()  # users who've received the telegram guide this session
+# ping_interval = None means pings are disabled; otherwise it's the interval in seconds
+PING_INTERVAL_DEFAULT: int | None = None if SKIP_FIRST_PING else 4 * 3600
+
+
+@dataclass
+class BridgeState:
+    """Everything this process mutates at runtime.
+
+    Module level holds configuration and constants; this holds the rest, so the mutable
+    surface of the bridge is one object created in main() and injected at registration
+    rather than a scattered set of globals. Handlers receive it as a parameter and use
+    only the fields they need.
+    """
+
+    agent_id: str                     # resolved once from the registry; read-only after
+    authenticated: set[int] = field(default_factory=set)
+    briefed: set[int] = field(default_factory=set)
+    failed_auth_attempts: int = 0     # consecutive wrong passwords; only the authorized
+                                      # account can raise it (is_known_user gates /start)
+    verbose_mode: str = OutputMode.TAGS
+    user_turn_active: bool = False    # a chat turn is running
+    bridge_run_active: bool = False   # this bridge's own turn is in flight; read by the
+                                      # relay's suppression check
+    relay: StreamRelay | None = None
+    ping_interval: int | None = PING_INTERVAL_DEFAULT
+    ping_job: object | None = None
+
 
 TELEGRAM_GUIDE = """[TELEGRAM BRIDGE GUIDE — first message of this session]
 
@@ -114,14 +128,6 @@ def format_incoming_message(user_message: str, include_guide: bool) -> str:
         return f"{TELEGRAM_GUIDE}\n\n[via Telegram]\n{user_message}"
     return f"{TELEGRAM_HEADER}\n{user_message}"
 
-# Periodic ping state
-# These are module-level so they persist across async calls but reset on script restart
-ping_job = None           # Reference to the scheduled job (so we can cancel/modify it)
-# ping_interval = None means pings are disabled; otherwise it's the interval in seconds
-if SKIP_FIRST_PING:
-    ping_interval = None  # Actually disabled, not just very long
-else:
-    ping_interval = 4 * 3600  # Default: 4 hours in seconds
 
 
 def parse_interval(interval_str: str) -> int | None:
@@ -167,7 +173,7 @@ def _chunk(text: str, limit: int) -> list[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)]
 
 
-async def send_message(message: str, bot=None, chat_id: int | None = None) -> dict:
+async def send_message(message: str, state: BridgeState, bot=None, chat_id: int | None = None) -> dict:
     """Send a message to the agent and return its response.
 
     Returns dict with 'success', 'result', and 'updates_sent' keys.
@@ -179,22 +185,21 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
     """
     # report_failures=False: handle_message replies "Error: …" itself when a turn fails,
     # so the policy must not also narrate the failure.
-    policy = OutputPolicy(lambda: verbose_mode, report_failures=False) if bot is not None else None
+    policy = OutputPolicy(lambda: state.verbose_mode, report_failures=False) if bot is not None else None
 
     async def on_event(event_type: str, data: dict) -> None:
         for text in policy.feed(event_type, data):
             await send_chat_text(bot, chat_id, text)
 
-    global bridge_run_active
     try:
         # Mark our own run: /stream_on relays *other* clients' runs, and this turn is
         # already being delivered through the tag path — relaying it too would duplicate
         # every line on the phone.
-        bridge_run_active = True
+        state.bridge_run_active = True
         if policy is not None:
             policy.reset()
         text = await send_message_async(
-            SERVER_URL, AGENT_ID, message, MESSAGE_TIMEOUT_SECONDS,
+            SERVER_URL, state.agent_id, message, MESSAGE_TIMEOUT_SECONDS,
             on_event=on_event if policy else None,
         )
         return {
@@ -205,7 +210,7 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
     except AgentStreamError as e:
         return {"success": False, "result": str(e), "updates_sent": 0}
     finally:
-        bridge_run_active = False
+        state.bridge_run_active = False
 
 
 def shutdown_after_failed_attempts(context, attempts: int) -> None:
@@ -224,19 +229,19 @@ def shutdown_after_failed_attempts(context, attempts: int) -> None:
     context.application.stop_running()
 
 
-async def send_alert_to_opus(message: str):
+async def send_alert_to_opus(message: str, state: BridgeState):
     """Send a fire-and-forget alert to the agent.
 
     The response is discarded, but the stream is still consumed so the agent
     run completes server-side (dropping the connection mid-run could cancel it).
     """
     try:
-        await send_message_async(SERVER_URL, AGENT_ID, message, ALERT_TIMEOUT_SECONDS)
+        await send_message_async(SERVER_URL, state.agent_id, message, ALERT_TIMEOUT_SECONDS)
     except AgentStreamError as e:
         print(f"[{AGENT_NAME}] Alert delivery failed: {e}")
 
 
-async def parse_and_execute_commands(opus_response: str, bot, job_queue=None, current_job=None, application=None):
+async def parse_and_execute_commands(opus_response: str, context, state: BridgeState):
     """
     Parse Opus's response for commands and execute them.
 
@@ -249,8 +254,10 @@ async def parse_and_execute_commands(opus_response: str, bot, job_queue=None, cu
 
     Returns dict of executed commands for logging/debugging.
     """
-    global ping_job, ping_interval
-
+    bot = context.bot
+    job_queue = context.job_queue
+    application = context.application
+    current_job = context.job
     executed = {}
 
     # MESSAGE_JAMES "content" — sends custom message to James
@@ -258,8 +265,8 @@ async def parse_and_execute_commands(opus_response: str, bot, job_queue=None, cu
     message_match = re.search(r'^\s*MESSAGE_JAMES\s*["\'](.+?)["\']\s*$', opus_response, re.IGNORECASE | re.MULTILINE | re.DOTALL)
     if message_match:
         target_user_id = int(AUTHORIZED_USER)
-        if target_user_id not in authenticated_users:
-            await send_alert_to_opus("[MESSAGE_JAMES FAILED] User has not authenticated yet (/start). Message not sent.")
+        if target_user_id not in state.authenticated:
+            await send_alert_to_opus("[MESSAGE_JAMES FAILED] User has not authenticated yet (/start). Message not sent.", state)
             executed["MESSAGE_JAMES"] = {"status": "failed", "reason": "user_not_authenticated"}
             print(f"[{AGENT_NAME}] MESSAGE_JAMES blocked: user {target_user_id} not authenticated")
         else:
@@ -271,29 +278,29 @@ async def parse_and_execute_commands(opus_response: str, bot, job_queue=None, cu
     # STOP — cancel periodic pings (must be on its own line)
     if re.search(r'^\s*STOP\s*$', opus_response, re.IGNORECASE | re.MULTILINE) and current_job:
         current_job.schedule_removal()
-        ping_job = None
+        state.ping_job = None
         executed["STOP"] = True
         print(f"[{AGENT_NAME}] Ping stopped")# SET_INTERVAL "duration" — change ping frequency (must be on its own line)
     interval_match = re.search(r'^\s*SET_INTERVAL\s*["\'](.+?)["\']\s*$', opus_response, re.IGNORECASE | re.MULTILINE)
     if interval_match and job_queue:
         new_interval = parse_interval(interval_match.group(1))
         if new_interval and new_interval >= 60:  # Minimum 1 minute
-            ping_interval = new_interval
+            state.ping_interval = new_interval
             if current_job:
                 current_job.schedule_removal()
-            ping_job = job_queue.run_repeating(
-                periodic_ping,
-                interval=ping_interval,
-                first=ping_interval
+            state.ping_job = job_queue.run_repeating(
+                _ping_callback(state),
+                interval=new_interval,
+                first=new_interval,
             )
-            executed["SET_INTERVAL"] = ping_interval
-            alertStr = f"Interval updated to {ping_interval} seconds"
+            executed["SET_INTERVAL"] = new_interval
+            alertStr = f"Interval updated to {new_interval} seconds"
             print(f"[{AGENT_NAME}] {alertStr}")
-            await send_alert_to_opus(alertStr)
+            await send_alert_to_opus(alertStr, state)
         else:
             failureStr = f"Invalid interval in: {opus_response[:100]}"
             print(f"[{AGENT_NAME}] {failureStr}")
-            await send_alert_to_opus(failureStr)
+            await send_alert_to_opus(failureStr, state)
 
     # AUTONOMOUS and SKIP are informational (must be on their own line)
     if re.search(r'^\s*AUTONOMOUS\s*$', opus_response, re.IGNORECASE | re.MULTILINE):
@@ -309,7 +316,7 @@ async def parse_and_execute_commands(opus_response: str, bot, job_queue=None, cu
         executed["KILL_TELEGRAM"] = True
         print(f"[{AGENT_NAME}] !!! KILL_TELEGRAM invoked — shutting down Telegram bridge !!!")
         # Alert before shutdown so it's in the conversation history
-        await send_alert_to_opus("[KILL_TELEGRAM EXECUTED] Telegram bridge shutting down. Restart manually when safe.")
+        await send_alert_to_opus("[KILL_TELEGRAM EXECUTED] Telegram bridge shutting down. Restart manually when safe.", state)
         # Graceful shutdown — this will stop polling and exit run_polling()
         if application:
             application.stop_running()
@@ -317,7 +324,16 @@ async def parse_and_execute_commands(opus_response: str, bot, job_queue=None, cu
     return executed
 
 
-async def periodic_ping(context):
+def _ping_callback(state: BridgeState):
+    """Adapter so JobQueue callbacks get the same state the handlers do."""
+
+    async def ping(context):
+        await periodic_ping(context, state)
+
+    return ping
+
+
+async def periodic_ping(context, state: BridgeState):
     """
     Scheduled callback that pings Opus asking if she wants autonomous time.
 
@@ -343,17 +359,17 @@ async def periodic_ping(context):
     basicMsg = (
         f"[SELF WAKE PERIODIC PING] If desired, you can run commands, call tools, take autonomous time, etc.\n"
         f"Commands: MESSAGE_JAMES \"text\", AUTONOMOUS, SKIP, STOP, SET_INTERVAL \"duration\"\n"
-        f"Curr Ping Interval: {ping_interval}Sec/Ping\n"
+        f"Curr Ping Interval: {state.ping_interval}Sec/Ping\n"
     )
 
     longPingStopSuggestion = f"If further pings are not desired for now, please invoke the STOP Cmd\n"  # also notifies on first ping since it is long
 
-    if ping_interval >= 3600*2:
+    if (state.ping_interval or 0) >= 3600 * 2:
         prompt = basicMsg + longPingStopSuggestion
     else:
         prompt = basicMsg
 
-    result = await send_message(prompt, bot=context.bot, chat_id=int(AUTHORIZED_USER))
+    result = await send_message(prompt, state, bot=context.bot, chat_id=int(AUTHORIZED_USER))
 
     if not result["success"]:
         print(f"[{AGENT_NAME}] Ping failed: {result['result']}")
@@ -362,54 +378,40 @@ async def periodic_ping(context):
     opus_response = result["result"]
 
     # Parse and execute commands
-    executed = await parse_and_execute_commands(
-        opus_response,
-        bot=context.bot,
-        job_queue=context.job_queue,
-        current_job=context.job,
-        application=context.application
-    )
+    executed = await parse_and_execute_commands(opus_response, context, state)
 
     if not executed:
         print(f"[{AGENT_NAME}] No command recognized in: {opus_response[:100]}")
 
 
-async def handle_message(update: Update, context):
+async def handle_message(update: Update, context, state: BridgeState):
     user_id = update.effective_user.id
-
-    global user_turn_active
     # Updates are processed concurrently (so /cancel and /stream_off can land mid-run),
     # which means a second message can arrive while a turn is still running. Queueing is
     # no longer automatic, and the server would answer 423 Locked — say what is happening
     # instead of surfacing a raw HTTP error.
-    if user_turn_active:
+    if state.user_turn_active:
         await update.message.reply_text("Still working on the previous message — /cancel to interrupt.")
         return
 
     user_message = update.message.text
 
-    first_of_session = user_id not in briefed_users
-    briefed_users.add(user_id)
+    first_of_session = user_id not in state.briefed
+    state.briefed.add(user_id)
     formatted_message = format_incoming_message(user_message, first_of_session)
 
-    user_turn_active = True
+    state.user_turn_active = True
     try:
-        result = await send_message(formatted_message, bot=context.bot, chat_id=update.message.chat_id)
+        result = await send_message(formatted_message, state, bot=context.bot, chat_id=update.message.chat_id)
     finally:
-        user_turn_active = False
+        state.user_turn_active = False
 
     if result["success"]:
         opus_response = result["result"]
 
         # Parse any embedded commands (same parser as periodic_ping)
         # This lets Opus control ping settings from regular conversation too
-        await parse_and_execute_commands(
-            opus_response,
-            bot=context.bot,
-            job_queue=context.application.job_queue,
-            current_job=ping_job,
-            application=context.application
-        )
+        await parse_and_execute_commands(opus_response, context, state)
 
         if result["updates_sent"] > 0:
             pass  # <telegram> tag sends already delivered content progressively
@@ -426,7 +428,21 @@ async def handle_message(update: Update, context):
         else:
             await update.message.reply_text(f"Error: {detail}")
 
-def _auth_required(handler):
+def _with_state(handler, state: BridgeState):
+    """Inject BridgeState as the handler's third argument at registration.
+
+    Handlers then declare (update, context, state) and reach only the fields they use —
+    no module-level mutable state to accidentally share.
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context):
+        await handler(update, context, state)
+
+    return wrapper
+
+
+def _auth_required(handler, state: BridgeState):
     """Gate a handler behind _is_authenticated — applied at registration, in one place.
 
     Every handler except /start (the way in) is registered through this. A per-handler
@@ -438,8 +454,8 @@ def _auth_required(handler):
 
     @functools.wraps(handler)
     async def wrapper(update: Update, context):
-        if await _is_authenticated(update):
-            await handler(update, context)
+        if await _is_authenticated(update, state):
+            await handler(update, context, state)
 
     # Explicit marker: __wrapped__ is set by any functools.wraps decorator, so it cannot
     # distinguish this gate from a logging wrapper. test_auth_gating.py looks for this.
@@ -453,7 +469,7 @@ async def send_chat_text(bot, chat_id: int, text: str) -> None:
         await bot.send_message(chat_id=chat_id, text=chunk)
 
 
-async def _is_authenticated(update: Update) -> bool:
+async def _is_authenticated(update: Update, state: BridgeState) -> bool:
     """Is this a known user who has completed /start?
 
     Unknown users are dropped silently (no reply, no information); known users who have
@@ -462,13 +478,13 @@ async def _is_authenticated(update: Update) -> bool:
     user_id = update.effective_user.id
     if not is_known_user(user_id):
         return False
-    if user_id not in authenticated_users:
+    if user_id not in state.authenticated:
         await update.message.reply_text("Please connect first with /start")
         return False
     return True
 
 
-async def set_verbose(update: Update, context):
+async def set_verbose(update: Update, context, state: BridgeState):
     """Choose how much of a run appears in chat. /verbose on|off — bare reports the mode.
 
     on  : all agent output (thinking excluded) plus tool calls, for both this bridge's
@@ -478,60 +494,56 @@ async def set_verbose(update: Update, context):
     Read at each emission point rather than captured, so flipping it mid-run changes what
     you see from the next event onward.
     """
-    global verbose_mode
-
     arg = context.args[0].lower() if context.args else ""
     if arg in ("on", "off"):
-        verbose_mode = OutputMode.VERBOSE if arg == "on" else OutputMode.TAGS
+        state.verbose_mode = OutputMode.VERBOSE if arg == "on" else OutputMode.TAGS
     elif arg:
         await update.message.reply_text("Usage: /verbose on|off")
         return
 
-    showing = "verbose (all output + tool calls)" if verbose_mode == OutputMode.VERBOSE else "normal (tagged content only)"
+    showing = "verbose (all output + tool calls)" if state.verbose_mode == OutputMode.VERBOSE else "normal (tagged content only)"
     await update.message.reply_text(f"Mode: {showing}")
 
 
-async def background_stream(update: Update, context):
+async def background_stream(update: Update, context, state: BridgeState):
     """Watch this agent's background runs. /background_stream on|off — bare reports state.
 
     "Background" means runs this bridge didn't start: another client, a TUI session. Runs
     started through Telegram arrive through the tag path and are excluded here.
     """
-    global stream_relay
-
     arg = context.args[0].lower() if context.args else ""
     if arg not in ("", "on", "off"):
         await update.message.reply_text("Usage: /background_stream on|off")
         return
 
     if arg == "on":
-        if stream_relay is not None and stream_relay.is_running:
-            await update.message.reply_text(f"Background stream already {stream_relay.status()}.")
+        if state.relay is not None and state.relay.is_running:
+            await update.message.reply_text(f"Background stream already {state.relay.status()}.")
             return
         chat_id = update.message.chat_id
-        stream_relay = StreamRelay(
+        state.relay = StreamRelay(
             SERVER_URL,
-            AGENT_ID,
+            state.agent_id,
             send=lambda text: send_chat_text(context.bot, chat_id, text),
-            mode=lambda: verbose_mode,
-            suppress=lambda: bridge_run_active,
+            mode=lambda: state.verbose_mode,
+            suppress=lambda: state.bridge_run_active,
         )
-        stream_relay.start()
-        await update.message.reply_text(f"Background stream: {stream_relay.status()}. /background_stream off to stop.")
+        state.relay.start()
+        await update.message.reply_text(f"Background stream: {state.relay.status()}. /background_stream off to stop.")
         return
 
     if arg == "off":
-        if stream_relay is None or not stream_relay.is_running:
+        if state.relay is None or not state.relay.is_running:
             await update.message.reply_text("Background stream is not running.")
             return
-        await stream_relay.stop("background stream off (the run keeps going)")
+        await state.relay.stop("background stream off (the run keeps going)")
         return
 
-    state = stream_relay.status() if stream_relay is not None else "off"
-    await update.message.reply_text(f"Background stream: {state}")
+    current = state.relay.status() if state.relay is not None else "off"
+    await update.message.reply_text(f"Background stream: {current}")
 
 
-async def cancel_run(update: Update, context):
+async def cancel_run(update: Update, context, state: BridgeState):
     """Interject: cancel the agent's in-flight run — including one started elsewhere.
 
     The bridge holds its own turn open for up to MESSAGE_TIMEOUT_SECONDS, so updates are
@@ -540,7 +552,7 @@ async def cancel_run(update: Update, context):
     """
 
     try:
-        accepted = await cancel_agent_run_async(SERVER_URL, AGENT_ID)
+        accepted = await cancel_agent_run_async(SERVER_URL, state.agent_id)
     except AgentStreamError as e:
         await update.message.reply_text(f"Cancel failed: {e}")
         return
@@ -550,9 +562,7 @@ async def cancel_run(update: Update, context):
         await update.message.reply_text("No run is active.")
 
 
-async def start(update: Update, context):
-    global failed_auth_attempts
-
+async def start(update: Update, context, state: BridgeState):
     user_id = update.effective_user.id
 
     if not is_known_user(user_id):
@@ -570,21 +580,21 @@ async def start(update: Update, context):
     if not context.args or context.args[0] != TELEGRAM_PASSWORD:
         # Only alert me if they actually tried a password (not just /start alone)
         if context.args:
-            failed_auth_attempts += 1
-            await send_alert_to_opus(f"[SECURITY ALERT via Telegram] Failed authentication attempt from user ID: {user_id}")
-            if failed_auth_attempts >= MAX_FAILED_AUTH_ATTEMPTS:
-                shutdown_after_failed_attempts(context, failed_auth_attempts)
+            state.failed_auth_attempts += 1
+            await send_alert_to_opus(f"[SECURITY ALERT via Telegram] Failed authentication attempt from user ID: {user_id}", state)
+            if state.failed_auth_attempts >= MAX_FAILED_AUTH_ATTEMPTS:
+                shutdown_after_failed_attempts(context, state.failed_auth_attempts)
         await update.message.reply_text("Hmm, I don't understand. Please try again?")
         return
 
     # Correct password
-    failed_auth_attempts = 0
-    authenticated_users.add(user_id)
-    briefed_users.discard(user_id)  # re-auth re-briefs: guide arrives with next message
+    state.failed_auth_attempts = 0
+    state.authenticated.add(user_id)
+    state.briefed.discard(user_id)  # re-auth re-briefs: guide arrives with next message
     await update.message.reply_text(f"Connected to {AGENT_NAME}! Send me a message.")
 
 
-async def help_cmd(update: Update, context):
+async def help_cmd(update: Update, context, state: BridgeState):
     """List the commands this bridge accepts, built from COMMANDS itself."""
     lines = ["Commands:"]
     lines += [f"/{command.name} — {command.description}" for command in COMMANDS]
@@ -622,7 +632,7 @@ AUTH_GATED_CMDS: tuple[BridgeCommand, ...] = (
 COMMANDS: tuple[BridgeCommand, ...] = (START_CMD,) + AUTH_GATED_CMDS
 
 
-def build_application() -> Application:
+def build_application(state: BridgeState) -> Application:
     """Build the Application and register handlers — no polling, no agent lookup.
 
     Separated from main() so the handler wiring (and its auth gating) can be asserted
@@ -638,23 +648,24 @@ def build_application() -> Application:
 
     # Each list is registered for what it is: the entry point as-is, everything else
     # wrapped. Nothing here decides gating — the declaration already did.
-    app.add_handler(CommandHandler(START_CMD.name, START_CMD.handler))
+    app.add_handler(CommandHandler(START_CMD.name, _with_state(START_CMD.handler, state)))
     for command in AUTH_GATED_CMDS:
-        app.add_handler(CommandHandler(command.name, _auth_required(command.handler)))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _auth_required(handle_message)))
+        app.add_handler(CommandHandler(command.name, _auth_required(command.handler, state)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _auth_required(handle_message, state)))
 
     return app
 
 
 def main():
-    global ping_job, AGENT_ID
+    # Resolve the agent ID from the registry before starting — fail fast if the server is
+    # down or the agent doesn't exist. Done before the state exists, so the id is a
+    # constructor argument rather than something mutated later.
+    agent_id = asyncio.run(resolve_agent_id_by_name_async(SERVER_URL, AGENT_NAME))
+    print(f"[{AGENT_NAME}] Connected to agent ({agent_id}) at {SERVER_URL}")
 
-    # Resolve the agent ID from the registry before starting — fail fast
-    # if the server is down or the agent doesn't exist.
-    AGENT_ID = asyncio.run(resolve_agent_id_by_name_async(SERVER_URL, AGENT_NAME))
-    print(f"[{AGENT_NAME}] Connected to agent ({AGENT_ID}) at {SERVER_URL}")
+    state = BridgeState(agent_id=agent_id)
 
-    app = build_application()
+    app = build_application(state)
 
     # Schedule the periodic ping using JobQueue (if enabled)
     # JobQueue is built into python-telegram-bot — it manages scheduled tasks
@@ -664,15 +675,15 @@ def main():
     #   - callback: the async function to run
     #   - interval: seconds between runs
     #   - first: seconds until FIRST run
-    if ping_interval:
-        ping_job = app.job_queue.run_repeating(
-            periodic_ping,
-            interval=ping_interval,
+    if state.ping_interval:
+        state.ping_job = app.job_queue.run_repeating(
+            _ping_callback(state),
+            interval=state.ping_interval,
             first=10  # TODO: Change to ping_interval for production
         )
 
-    if ping_interval:
-        print(f"[{AGENT_NAME}] Bot running with polling... Ping interval: {ping_interval} seconds")
+    if state.ping_interval:
+        print(f"[{AGENT_NAME}] Bot running with polling... Ping interval: {state.ping_interval} seconds")
     else:
         print(f"[{AGENT_NAME}] Bot running with polling... Pings disabled")
 

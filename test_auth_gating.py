@@ -32,6 +32,11 @@ class _FakeMessage:
         self.replies.append(text)
 
 
+def _state() -> "bridge.BridgeState":
+    """Fresh per-test state; the bridge's mutable world lives in this object."""
+    return bridge.BridgeState(agent_id="agent-1")
+
+
 def _update(user_id: int) -> SimpleNamespace:
     return SimpleNamespace(effective_user=SimpleNamespace(id=user_id), message=_FakeMessage())
 
@@ -46,7 +51,7 @@ def test_every_handler_except_start_is_gated():
     screen, and a reviewer can see at a glance that, say, /cancel is gated rather than
     inferring it from a rule.
     """
-    app = bridge.build_application()
+    app = bridge.build_application(_state())
     handlers = [handler for group in app.handlers.values() for handler in group]
 
     gated = {
@@ -68,12 +73,13 @@ class TestGateBehaviour:
     def test_known_but_unauthenticated_user_is_told_how_and_handler_does_not_run(self):
         calls: list[str] = []
 
-        async def handler(update, context):
+        async def handler(update, context, state):
             calls.append("ran")
 
         update = _update(bridge.ALLOWED_USER_IDS[0])
+        state = _state()
 
-        asyncio.run(bridge._auth_required(handler)(update, None))
+        asyncio.run(bridge._auth_required(handler, state)(update, None))
 
         assert calls == []
         assert update.message.replies == ["Please connect first with /start"]
@@ -82,12 +88,13 @@ class TestGateBehaviour:
         """No reply, no information: an unknown sender learns nothing about the bot."""
         calls: list[str] = []
 
-        async def handler(update, context):
+        async def handler(update, context, state):
             calls.append("ran")
 
         update = _update(user_id=999)
+        state = _state()
 
-        asyncio.run(bridge._auth_required(handler)(update, None))
+        asyncio.run(bridge._auth_required(handler, state)(update, None))
 
         assert calls == []
         assert update.message.replies == []
@@ -95,16 +102,15 @@ class TestGateBehaviour:
     def test_authenticated_user_reaches_the_handler(self):
         calls: list[str] = []
 
-        async def handler(update, context):
+        async def handler(update, context, state):
             calls.append("ran")
 
         user_id = bridge.ALLOWED_USER_IDS[0]
-        bridge.authenticated_users.add(user_id)
-        try:
-            update = _update(user_id)
-            asyncio.run(bridge._auth_required(handler)(update, None))
-        finally:
-            bridge.authenticated_users.discard(user_id)
+        state = _state()
+        state.authenticated.add(user_id)
+        update = _update(user_id)
+
+        asyncio.run(bridge._auth_required(handler, state)(update, None))
 
         assert calls == ["ran"]
         assert update.message.replies == []
@@ -151,10 +157,8 @@ class TestFailedAttemptTripwire:
     rather than a DoS lever a stranger could pull."""
 
     @pytest.fixture(autouse=True)
-    def _reset_counter(self):
-        bridge.failed_auth_attempts = 0
-        yield
-        bridge.failed_auth_attempts = 0
+    def _state(self):
+        self.state = _state()
 
     def _fail(self, attempts: int, chat_id: int = None) -> SimpleNamespace:
         update = None
@@ -164,7 +168,7 @@ class TestFailedAttemptTripwire:
 
     def _send_wrong_password(self, chat_id: int = None) -> SimpleNamespace:
         update = _auth_update(bridge.ALLOWED_USER_IDS[0], chat_id or bridge.ALLOWED_USER_IDS[0], ["wrong"])
-        asyncio.run(bridge.start(update, update))
+        asyncio.run(bridge.start(update, update, self.state))
         return update
 
     def test_four_failures_leave_the_bridge_running(self):
@@ -196,12 +200,12 @@ class TestFailedAttemptTripwire:
         self._fail(4)
 
         ok = _auth_update(bridge.ALLOWED_USER_IDS[0], bridge.ALLOWED_USER_IDS[0], ["correct-horse"])
-        asyncio.run(bridge.start(ok, ok))
+        asyncio.run(bridge.start(ok, ok, self.state))
 
-        assert bridge.failed_auth_attempts == 0
+        assert self.state.failed_auth_attempts == 0
         self._send_wrong_password()
 
-        assert bridge.failed_auth_attempts == 1
+        assert self.state.failed_auth_attempts == 1
 
 
 def test_main_starts_polling_with_a_clean_backlog(monkeypatch):
@@ -221,7 +225,7 @@ class TestCommandRegistry:
     """COMMANDS is the single declaration; these tests stop it drifting from reality."""
 
     def test_every_registry_entry_is_registered_as_a_command_handler(self):
-        app = bridge.build_application()
+        app = bridge.build_application(_state())
         registered = {
             command
             for group in app.handlers.values()
@@ -244,7 +248,7 @@ class TestCommandRegistry:
     def test_help_lists_every_command_with_its_description(self):
         update = _update(bridge.ALLOWED_USER_IDS[0])
 
-        asyncio.run(bridge.help_cmd(update, None))
+        asyncio.run(bridge.help_cmd(update, None, _state()))
 
         text = update.message.replies[0]
         assert ["/" + entry.name for entry in bridge.COMMANDS] == [

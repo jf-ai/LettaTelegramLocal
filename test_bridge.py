@@ -14,6 +14,7 @@ Run:
 """
 
 import asyncio
+from types import SimpleNamespace
 import sys
 
 sys.path.insert(0, "/home/gossf/git/LettaTelegramLocal")
@@ -53,13 +54,13 @@ async def test_bridge_wrappers(agent_id):
     # Bridge wrappers use module globals from .env (production port 8000);
     # point them at the local test server for this test.
     bridge.SERVER_URL = SERVER_URL
-    bridge.AGENT_ID = agent_id
-    result = await bridge.send_message("Say exactly: HELLO_BRIDGE and nothing else.")
+    state = bridge.BridgeState(agent_id=agent_id)
+    result = await bridge.send_message("Say exactly: HELLO_BRIDGE and nothing else.", state)
     assert result["success"], f"bridge send_message failed: {result['result']}"
     assert "HELLO_BRIDGE" in result["result"], f"bridge: {result['result']!r}"
     print(f"[PASS] bridge send_message wrapper: {result['result'][:60]!r}")
 
-    await bridge.send_alert_to_opus("[TEST ALERT] Bridge smoke test alert.")
+    await bridge.send_alert_to_opus("[TEST ALERT] Bridge smoke test alert.", state)
     print("[PASS] send_alert: completed without exception")
 
 
@@ -105,9 +106,20 @@ class FakeApplication:
         self.stopped = True
 
 
+def make_context(bot, job_queue=None, job=None, application=None):
+    """The slice of a PTB CallbackContext the bridge's parser actually reads."""
+    return SimpleNamespace(
+        bot=bot,
+        job_queue=job_queue or FakeJobQueue(),
+        job=job,
+        application=application or FakeApplication(),
+    )
+
+
 async def test_commands():
     bot = FakeBot()
-    bridge.authenticated_users.add(int(bridge.AUTHORIZED_USER))
+    state = bridge.BridgeState(agent_id="agent-1")
+    state.authenticated.add(int(bridge.AUTHORIZED_USER))
 
     response = (
         "Some intro text.\n"
@@ -117,17 +129,17 @@ async def test_commands():
         "STOP\n"
     )
     executed = await bridge.parse_and_execute_commands(
-        response, bot=bot, job_queue=FakeJobQueue(), current_job=FakeJob()
+        response, make_context(bot, job=FakeJob()), state
     )
     assert executed.get("MESSAGE_JAMES") == "Bridge smoke test message", executed
-    assert executed.get("SET_INTERVAL") == 7200, executed
+    assert executed.get("SET_INTERVAL") == 7200 and state.ping_interval == 7200, executed
     assert executed.get("AUTONOMOUS") is True, executed
     assert executed.get("STOP") is True, executed
     assert bot.sent == [(int(bridge.AUTHORIZED_USER), "Bridge smoke test message")], bot.sent
     print(f"[PASS] command parsing: {list(executed.keys())}")
 
     app = FakeApplication()
-    executed = await bridge.parse_and_execute_commands("KILL_TELEGRAM", bot=bot, application=app)
+    executed = await bridge.parse_and_execute_commands("KILL_TELEGRAM", make_context(bot, application=app), state)
     assert executed.get("KILL_TELEGRAM") is True and app.stopped is True
     print("[PASS] KILL_TELEGRAM: application.stop_running() called")
 
@@ -158,53 +170,42 @@ async def main():
     await test_send_message(agent_id)
     await test_bridge_wrappers(agent_id)
     await test_not_found_error()
-    await test_tag_sender_unit()
+    await test_output_policy_unit()
     await test_tag_progressive_live(agent_id)
     await test_format_incoming_message()
     await test_commands()
     print("\n=== ALL TESTS PASSED ===")
 
 
-async def test_tag_sender_unit():
-    """TelegramTagSender: progressive sends as tags close, none for partials.
+async def test_output_policy_unit():
+    """Tags mode: partial tags held, each completed tag emitted once, in order.
 
-    Mirrors the real contract: scan() receives the full accumulated buffer
-    each time (it grows as the run streams).
+    Mirrors the real contract: every event carries new text only, while the policy keeps
+    the run's buffer and cursor.
     """
-    bridge.authenticated_users.add(int(bridge.AUTHORIZED_USER))
-    bot = FakeBot()
-    chat_id = int(bridge.AUTHORIZED_USER)
-    sender = bridge.TelegramTagSender(bot, chat_id)
+    policy = bridge.OutputPolicy(lambda: bridge.OutputMode.TAGS)
 
-    # Partial tag — not sent yet
-    buffer = "working on it... <telegram>progress update"
-    await sender.scan(buffer)
-    assert sender.sent_count == 0 and bot.sent == [], (sender.sent_count, bot.sent)
+    def delta(text):
+        return policy.feed("PartDeltaEvent", {"delta": {"content_delta": text}})
 
-    # Tag closes — sent, untagged preamble NOT sent
-    buffer += "</telegram> more private notes..."
-    await sender.scan(buffer)
-    assert sender.sent_count == 1, sender.sent_count
-    assert bot.sent == [(chat_id, "progress update")], bot.sent
-
-    # Second tag closes — progressive: only the new one
-    buffer += "<telegram>second update</telegram>"
-    await sender.scan(buffer)
-    assert sender.sent_count == 2
-    assert bot.sent[-1] == (chat_id, "second update"), bot.sent
-    print(f"[PASS] TelegramTagSender unit: partials held, completes sent progressively ({sender.sent_count} sends)")
+    assert delta("working on it... <telegram>progress update") == []
+    assert delta("</telegram> more private notes...") == ["progress update"]
+    assert delta("<telegram>second update</telegram>") == ["second update"]
+    assert policy.sent_count == 2, policy.sent_count
+    print("[PASS] OutputPolicy unit: partials held, completed tags emitted progressively")
 
 
 async def test_tag_progressive_live(agent_id):
     """Live: agent wraps output in tags → sent progressively, updates_sent=1."""
     bridge.SERVER_URL = SERVER_URL
-    bridge.AGENT_ID = agent_id
-    bridge.authenticated_users.add(int(bridge.AUTHORIZED_USER))
+    state = bridge.BridgeState(agent_id=agent_id)
+    state.authenticated.add(int(bridge.AUTHORIZED_USER))
     bot = FakeBot()
     chat_id = int(bridge.AUTHORIZED_USER)
 
     result = await bridge.send_message(
         'Reply with exactly: <telegram>TAGGED_LIVE_OK</telegram> and nothing else.',
+        state,
         bot=bot,
         chat_id=chat_id,
     )
@@ -217,6 +218,7 @@ async def test_tag_progressive_live(agent_id):
     # (used for command parsing; handle_message sends only the marker)
     result = await bridge.send_message(
         "Say exactly: UNTAGGED_NOT_SENT and nothing else.",
+        state,
         bot=bot,
         chat_id=chat_id,
     )
