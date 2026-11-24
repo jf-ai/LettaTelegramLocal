@@ -25,6 +25,42 @@ class AgentStreamError(RuntimeError):
     """Hard failure during an agent run (HTTP error, stream Error event, connection error)."""
 
 
+class SSEEventParser:
+    """Incremental SSE framing: feed lines, get (event_type, data) as each block completes.
+
+    Shared by every consumer of an agent event stream (foreground turn, background relay)
+    so framing is defined once. Data is decoded as JSON when possible and passed through
+    as a dict; a malformed block yields {} rather than raising, matching the server's
+    own tolerance for partial data.
+    """
+
+    def __init__(self) -> None:
+        self._event_type: str | None = None
+        self._data_lines: list[str] = []
+
+    def feed(self, line: str) -> tuple[str, dict] | None:
+        if line.startswith("event:"):
+            self._event_type = line[6:].strip()
+            self._data_lines = []
+        elif line.startswith("data:"):
+            self._data_lines.append(line[5:].strip())
+        elif line == "" and self._event_type:
+            event_type, data = self._event_type, self._parse(self._data_lines)
+            self._event_type, self._data_lines = None, []
+            return event_type, data
+        return None
+
+    @staticmethod
+    def _parse(data_lines: list[str]) -> dict:
+        if not data_lines:
+            return {}
+        try:
+            parsed = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+
 class _ResponseAccumulator:
     """Feed SSE lines from an agent run stream; accumulate the text response.
 
@@ -35,29 +71,19 @@ class _ResponseAccumulator:
     def __init__(self):
         self.text_parts: list[str] = []
         self._in_thinking = False
-        self._event_type = None
-        self._data_lines = []
+        self._parser = SSEEventParser()
         self.error: str | None = None
 
-    def feed(self, line: str) -> None:
-        """Process one line from the SSE stream."""
-        if line.startswith("event:"):
-            self._event_type = line[6:].strip()
-            self._data_lines = []
-        elif line.startswith("data:"):
-            self._data_lines.append(line[5:].strip())
-        elif line == "" and self._event_type:
-            self._process_event("\n".join(self._data_lines))
-            self._event_type = None
-            self._data_lines = []
+    def feed(self, line: str) -> tuple[str, dict] | None:
+        """Process one line; return the event once its block completes."""
+        parsed = self._parser.feed(line)
+        if parsed is not None:
+            self._process_event(*parsed)
+        return parsed
 
-    def _process_event(self, data_str: str) -> None:
-        try:
-            data = json.loads(data_str) if data_str else {}
-        except json.JSONDecodeError:
-            data = {}
+    def _process_event(self, event_type: str, data: dict) -> None:
 
-        if self._event_type == "PartStartEvent":
+        if event_type == "PartStartEvent":
             part = data.get("part", {})
             part_kind = part.get("part_kind")
             if part_kind == "thinking":
@@ -66,11 +92,11 @@ class _ResponseAccumulator:
                 self._in_thinking = False
                 if content := part.get("content", ""):
                     self.text_parts.append(content)
-        elif self._event_type == "PartDeltaEvent":
+        elif event_type == "PartDeltaEvent":
             if not self._in_thinking:
                 if content := data.get("delta", {}).get("content_delta", ""):
                     self.text_parts.append(content)
-        elif self._event_type == "Error":
+        elif event_type == "Error":
             self.error = data.get("message", "Unknown error")
 
     def text(self) -> str:
@@ -86,15 +112,16 @@ def _timeout_text(acc: _ResponseAccumulator, timeout_seconds: float) -> str:
 
 async def send_message_async(server_url: str, agent_id: str, message: str,
                              timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-                             on_text_delta: Callable[[str], Awaitable[None]] | None = None) -> str:
+                             on_event: Callable[[str, dict], Awaitable[None]] | None = None) -> str:
     """Send a message and return the agent's text response (thinking excluded).
 
     Raises AgentStreamError on hard failures. On timeout, returns partial
     text plus a notice.
 
-    on_text_delta: optional async callback invoked with the full accumulated
-    text buffer after each text delta. Enables progressive consumption of
-    output mid-run (e.g. the telegram bridge's tag scanner).
+    on_event: optional async callback invoked with (event_type, data) as each SSE block
+    completes — the raw pydantic-ai events, before any accumulation. Callers that render
+    (the telegram bridge, the background relay) consume these through an OutputPolicy;
+    callers that only want the text ignore it.
     """
     url = f"{server_url}/agents/{agent_id}/messages"
     acc = _ResponseAccumulator()
@@ -105,12 +132,11 @@ async def send_message_async(server_url: str, agent_id: str, message: str,
                     detail = (await response.aread()).decode(errors="replace")[:200]
                     raise AgentStreamError(f"HTTP {response.status_code}: {detail}")
                 async for line in response.aiter_lines():
-                    parts_before = len(acc.text_parts)
-                    acc.feed(line)
+                    parsed = acc.feed(line)
                     if acc.error is not None:
                         raise AgentStreamError(acc.error)
-                    if on_text_delta is not None and len(acc.text_parts) != parts_before:
-                        await on_text_delta("".join(acc.text_parts))
+                    if parsed is not None and on_event is not None:
+                        await on_event(*parsed)
     except httpx.TimeoutException:
         return _timeout_text(acc, timeout_seconds)
     except httpx.RequestError as e:

@@ -18,6 +18,8 @@ import asyncio
 import functools
 import os
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -30,6 +32,7 @@ from agent_home_client import (
     resolve_agent_id_by_name_async,
     send_message_async,
 )
+from output_policy import OutputMode, OutputPolicy
 from registry import resolve_bot_token
 from stream_relay import StreamRelay
 
@@ -66,7 +69,8 @@ bridge_run_active = False     # True while this bridge's own turn is in flight.
 # TODO in stream_relay.StreamRelay for why this is client-side rather than the server's
 # Suppress-Broadcast header.
 user_turn_active = False      # True while handle_message is running a chat turn
-stream_relay: StreamRelay | None = None   # background relay started by /stream_on
+stream_relay: StreamRelay | None = None   # background relay started by /background_stream
+verbose_mode = OutputMode.TAGS            # what a run looks like in chat; see output_policy
 
 # Session state (clears on restart)
 authenticated_users = set()
@@ -163,33 +167,6 @@ def _chunk(text: str, limit: int) -> list[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)]
 
 
-class TelegramTagSender:
-    """Scans accumulated agent output for <telegram>...</telegram> tags and
-    sends each complete tag's content as a Telegram message as it closes.
-
-    This gives the agent progressive-update control over long agentic runs:
-    wrap output in tags and it reaches the user immediately, mid-run;
-    leave it untagged and it stays private. No tags at all = nothing sent.
-    """
-    def __init__(self, bot, chat_id: int):
-        self.bot = bot
-        self.chat_id = chat_id
-        self.sent_count = 0
-
-    async def scan(self, buffer: str) -> None:
-        """Send any newly-closed tags since the last scan."""
-        if self.chat_id not in authenticated_users:
-            return  # unauthenticated target — drop silently
-        pattern = rf"<{TELEGRAM_TAG}>(.*?)</{TELEGRAM_TAG}>"
-        matches = re.findall(pattern, buffer, re.DOTALL | re.IGNORECASE)
-        for content in matches[self.sent_count:]:
-            content = content.strip()
-            if content:
-                for chunk in _chunk(content, TELEGRAM_CHUNK_LIMIT):
-                    await self.bot.send_message(chat_id=self.chat_id, text=chunk)
-            self.sent_count += 1
-
-
 async def send_message(message: str, bot=None, chat_id: int | None = None) -> dict:
     """Send a message to the agent and return its response.
 
@@ -200,10 +177,13 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
     updates_sent counts those sends; callers send nothing when it's zero
     (no tags = no response — a minimal marker goes out instead).
     """
-    tag_sender = TelegramTagSender(bot, chat_id) if bot is not None else None
+    # report_failures=False: handle_message replies "Error: …" itself when a turn fails,
+    # so the policy must not also narrate the failure.
+    policy = OutputPolicy(lambda: verbose_mode, report_failures=False) if bot is not None else None
 
-    async def on_text_delta(buffer: str) -> None:
-        await tag_sender.scan(buffer)
+    async def on_event(event_type: str, data: dict) -> None:
+        for text in policy.feed(event_type, data):
+            await send_chat_text(bot, chat_id, text)
 
     global bridge_run_active
     try:
@@ -211,14 +191,16 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
         # already being delivered through the tag path — relaying it too would duplicate
         # every line on the phone.
         bridge_run_active = True
+        if policy is not None:
+            policy.reset()
         text = await send_message_async(
             SERVER_URL, AGENT_ID, message, MESSAGE_TIMEOUT_SECONDS,
-            on_text_delta=on_text_delta if tag_sender else None,
+            on_event=on_event if policy else None,
         )
         return {
             "success": True,
             "result": text,
-            "updates_sent": tag_sender.sent_count if tag_sender else 0,
+            "updates_sent": policy.sent_count if policy else 0,
         }
     except AgentStreamError as e:
         return {"success": False, "result": str(e), "updates_sent": 0}
@@ -486,49 +468,67 @@ async def _is_authenticated(update: Update) -> bool:
     return True
 
 
-async def stream_on(update: Update, context):
-    """Watch this agent's background runs. /stream_on [minutes] — endless by default.
+async def set_verbose(update: Update, context):
+    """Choose how much of a run appears in chat. /verbose on|off — bare reports the mode.
 
-    "Background" means runs this bridge didn't start: a TUI session, another client.
-    Runs started through Telegram are already delivered through the tag path and are
-    suppressed in the relay to avoid duplicate messages.
+    on  : all agent output (thinking excluded) plus tool calls, for both this bridge's
+          turns and background-streamed runs
+    off : only content wrapped in <telegram> tags
+
+    Read at each emission point rather than captured, so flipping it mid-run changes what
+    you see from the next event onward.
+    """
+    global verbose_mode
+
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("on", "off"):
+        verbose_mode = OutputMode.VERBOSE if arg == "on" else OutputMode.TAGS
+    elif arg:
+        await update.message.reply_text("Usage: /verbose on|off")
+        return
+
+    showing = "verbose (all output + tool calls)" if verbose_mode == OutputMode.VERBOSE else "normal (tagged content only)"
+    await update.message.reply_text(f"Mode: {showing}")
+
+
+async def background_stream(update: Update, context):
+    """Watch this agent's background runs. /background_stream on|off — bare reports state.
+
+    "Background" means runs this bridge didn't start: another client, a TUI session. Runs
+    started through Telegram arrive through the tag path and are excluded here.
     """
     global stream_relay
-    minutes: float | None = None
-    if context.args:
-        try:
-            minutes = float(context.args[0])
-        except ValueError:
-            await update.message.reply_text("Usage: /stream_on [minutes] — with no argument it streams until /stream_off")
-            return
-        if minutes <= 0:
-            await update.message.reply_text("Minutes must be greater than zero.")
-            return
 
-    if stream_relay is not None and stream_relay.is_running:
-        await update.message.reply_text(f"Already streaming ({stream_relay.status()}). /stream_off to stop.")
+    arg = context.args[0].lower() if context.args else ""
+    if arg not in ("", "on", "off"):
+        await update.message.reply_text("Usage: /background_stream on|off")
         return
 
-    chat_id = update.message.chat_id
-    stream_relay = StreamRelay(
-        SERVER_URL,
-        AGENT_ID,
-        send=lambda text: send_chat_text(context.bot, chat_id, text),
-        suppress=lambda: bridge_run_active,
-    )
-    stream_relay.start(minutes)
-
-    where = "endless until /stream_off" if minutes is None else f"{minutes:g} min"
-    await update.message.reply_text(f"Streaming background runs ({where}).")
-
-
-async def stream_off(update: Update, context):
-    """Stop the background relay. The agent's run keeps going."""
-
-    if stream_relay is None or not stream_relay.is_running:
-        await update.message.reply_text("No stream is running.")
+    if arg == "on":
+        if stream_relay is not None and stream_relay.is_running:
+            await update.message.reply_text(f"Background stream already {stream_relay.status()}.")
+            return
+        chat_id = update.message.chat_id
+        stream_relay = StreamRelay(
+            SERVER_URL,
+            AGENT_ID,
+            send=lambda text: send_chat_text(context.bot, chat_id, text),
+            mode=lambda: verbose_mode,
+            suppress=lambda: bridge_run_active,
+        )
+        stream_relay.start()
+        await update.message.reply_text(f"Background stream: {stream_relay.status()}. /background_stream off to stop.")
         return
-    await stream_relay.stop("stream off (the run keeps going)")
+
+    if arg == "off":
+        if stream_relay is None or not stream_relay.is_running:
+            await update.message.reply_text("Background stream is not running.")
+            return
+        await stream_relay.stop("background stream off (the run keeps going)")
+        return
+
+    state = stream_relay.status() if stream_relay is not None else "off"
+    await update.message.reply_text(f"Background stream: {state}")
 
 
 async def cancel_run(update: Update, context):
@@ -584,6 +584,38 @@ async def start(update: Update, context):
     await update.message.reply_text(f"Connected to {AGENT_NAME}! Send me a message.")
 
 
+async def help_cmd(update: Update, context):
+    """List the commands this bridge accepts, built from COMMANDS itself."""
+    lines = ["Commands:"]
+    lines += [f"/{command.name} — {command.description}" for command in COMMANDS]
+    await update.message.reply_text("\n".join(lines))
+
+
+@dataclass(frozen=True)
+class BridgeCommand:
+    """One inbound command: what to register, what to call, what to say about it.
+
+    This is the single declaration build_application() iterates and /help renders, so a
+    command cannot exist in the help text without being registered (or vice versa). The
+    test in test_auth_gating.py asserts that correspondence, because a registry that can
+    drift from the real registrations is just a second source of truth.
+    """
+
+    name: str
+    handler: Callable
+    description: str
+    gated: bool = True   # False only for /start, which must run before authentication
+
+
+COMMANDS: tuple[BridgeCommand, ...] = (
+    BridgeCommand("start", start, "connect with your password", gated=False),
+    BridgeCommand("help", help_cmd, "list these commands"),
+    BridgeCommand("verbose", set_verbose, "on|off (all output and tool calls, or only tagged content)"),
+    BridgeCommand("background_stream", background_stream, "on|off (watch runs started by other clients, e.g. a TUI)"),
+    BridgeCommand("cancel", cancel_run, "cancel the agent's in-flight run (any client's)"),
+)
+
+
 def build_application() -> Application:
     """Build the Application and register handlers — no polling, no agent lookup.
 
@@ -598,18 +630,12 @@ def build_application() -> Application:
     # With the default (one update at a time) they would queue until the run finished.
     app = builder.concurrent_updates(True).build()
 
-    # Every handler except /start (the authentication entry point) goes through
-    # _auth_required. Keep the gate visible in this one block; do not hand a bare callback
-    # to add_handler below this line.
-    app.add_handler(CommandHandler("start", start))
-    for handler in (
-        CommandHandler("stream_on", stream_on),
-        CommandHandler("stream_off", stream_off),
-        CommandHandler("cancel", cancel_run),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
-    ):
-        handler.callback = _auth_required(handler.callback)
-        app.add_handler(handler)
+    # Every command is declared once, in COMMANDS, and registered from it. /start is the
+    # only ungated one: it is how a session authenticates, so it cannot sit behind the gate.
+    for command in COMMANDS:
+        callback = _auth_required(command.handler) if command.gated else command.handler
+        app.add_handler(CommandHandler(command.name, callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _auth_required(handle_message)))
 
     return app
 

@@ -19,6 +19,7 @@ os.environ.setdefault("SKIP_FIRST_PING", "True")
 os.environ.setdefault("TELEGRAM_PASSWORD", "correct-horse")
 
 import pytest  # noqa: E402
+from telegram.ext import CommandHandler  # noqa: E402
 
 import LettaTelegramLocal as bridge  # noqa: E402  (must follow the env setup)
 
@@ -202,3 +203,35 @@ def test_main_starts_polling_with_a_clean_backlog(monkeypatch):
     bridge.main()
 
     assert captured == {"drop_pending_updates": True}
+
+
+class TestCommandRegistry:
+    """COMMANDS is the single declaration; these tests stop it drifting from reality."""
+
+    def test_every_registry_entry_is_registered_as_a_command_handler(self):
+        app = bridge.build_application()
+        registered = {
+            command
+            for group in app.handlers.values()
+            for handler in group
+            if isinstance(handler, CommandHandler)
+            for command in handler.commands
+        }
+
+        assert registered == {entry.name for entry in bridge.COMMANDS}
+
+    def test_every_command_is_described_for_help(self):
+        assert [entry.name for entry in bridge.COMMANDS if not entry.description.strip()] == []
+
+    def test_only_start_is_ungated_in_the_registry(self):
+        assert [entry.name for entry in bridge.COMMANDS if not entry.gated] == ["start"]
+
+    def test_help_lists_every_command_with_its_description(self):
+        update = _update(bridge.ALLOWED_USER_IDS[0])
+
+        asyncio.run(bridge.help_cmd(update, None))
+
+        text = update.message.replies[0]
+        assert ["/" + entry.name for entry in bridge.COMMANDS] == [
+            line.split(" — ")[0] for line in text.splitlines()[1:]
+        ]

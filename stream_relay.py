@@ -1,14 +1,14 @@
 """Relay an agent's background event stream into a Telegram chat.
 
 The bridge normally sees only the runs it starts itself: it POSTs a message and consumes
-that run's SSE response. Work started elsewhere — a TUI session, another client, a
-scheduled ping — is invisible to it. Agent Home broadcasts every run for an agent through
-``GET /agents/{id}/stream`` regardless of who started it, so subscribing to that stream is
-what lets a phone watch over a long tool-using run happening in a terminal.
+that run's SSE response. Work started elsewhere is invisible unless the bridge subscribes
+to ``GET /agents/{id}/stream``, where Agent Home publishes every run for an agent
+regardless of who started it (subject to the other client not suppressing its broadcast).
 
-Relay shape: run bookends, assistant text, and tool calls. Raw token deltas are coalesced
-and flushed on a timer — Telegram rate-limits to roughly one message per second per chat,
-so forwarding deltas would be both unusable and self-defeating.
+What the relay does with those events is not its own decision: it feeds them to the same
+OutputPolicy the foreground turn uses, so verbosity means the same thing on both paths.
+The relay owns only the connection — subscription, reconnection, and saying so when the
+stream drops.
 
 Kept independent of python-telegram-bot: the caller passes a ``send`` coroutine, which is
 what makes the relay testable without a bot.
@@ -16,56 +16,50 @@ what makes the relay testable without a bot.
 
 import asyncio
 import contextlib
-import json
 import logging
-import re
 from collections.abc import Awaitable, Callable
 
 import httpx
 
+from agent_home_client import SSEEventParser
+from output_policy import OutputPolicy
+
 logger = logging.getLogger(__name__)
 
-FLUSH_INTERVAL_SECONDS = 2.0
 RECONNECT_DELAY_SECONDS = 2.0
-PROMPT_PREVIEW_CHARS = 80
-TELEGRAM_TAG_RE = re.compile(r"</?telegram>", re.IGNORECASE)
 
 
 class StreamRelay:
     """Forwards one agent's broadcast stream to a chat until stopped.
 
-    send:      async callable(text) delivering one logical message (the caller handles
-               platform limits and its own formatting).
-    suppress:  callable returning True while the bridge is itself running a turn; the
-               relay then drops output, because that run is already being delivered
-               through the normal reply path and would otherwise arrive twice.
-
-               TODO: a client-side stand-in for per-run suppression. The obvious
-               alternative — POST /messages with Suppress-Broadcast — is worse than it
-               looks: it hides the run from the whole hub, so a Telegram-initiated run
-               also vanishes from the Nori/ACP session watching the same agent, and
-               seeing the agent work from either side is the point of this relay. The
-               real fix is suppress-by-broadcast-id: the bridge marks its own run and
-               subscribers filter that id, so every other subscriber still sees it. Needs
-               server support (an id on RunStartedEvent plus a request-side marker), so
-               it is parked until there is a second consumer that cares.
+    send:     async callable(text) delivering one logical message (the caller handles
+              platform limits).
+    mode:     callable returning the current OutputMode, consulted per event, so a
+              mid-run /verbose toggle takes effect from the next event.
+    suppress: callable returning True while the bridge is itself running a turn; the
+              relay then stays quiet, since that run is already delivered by the tag path.
     """
+
+    # TODO: suppression is client-side because the server's Suppress-Broadcast header
+    # hides a run from *every* subscriber. The wanted shape is per-subscriber: a client
+    # declares an identity when subscribing and the server does not echo a run back to its
+    # originator. Needs server support; parked until then.
 
     def __init__(
         self,
         server_url: str,
         agent_id: str,
         send: Callable[[str], Awaitable[None]],
+        mode: Callable[[], str],
         suppress: Callable[[], bool] | None = None,
     ) -> None:
         self._server_url = server_url
         self._agent_id = agent_id
         self._send = send
         self._suppress = suppress or (lambda: False)
+        self._policy = OutputPolicy(mode)
         self._task: asyncio.Task | None = None
         self._deadline: float | None = None
-        self._buffer: list[str] = []
-        self._in_thinking = False
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -82,7 +76,6 @@ class StreamRelay:
         return f"on (~{remaining / 60:.0f} min left)"
 
     def start(self, max_minutes: float | None = None) -> None:
-        """Begin relaying. max_minutes=None streams until stop()."""
         loop = asyncio.get_running_loop()
         self._deadline = None if max_minutes is None else loop.time() + max_minutes * 60
         self._task = asyncio.create_task(self._run(), name="stream-relay")
@@ -94,33 +87,29 @@ class StreamRelay:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        self._buffer.clear()
         await self._emit(f"[{reason}]")
 
     # --- connection loop ---------------------------------------------------
 
     async def _run(self) -> None:
-        """One connection at a time, reconnecting for as long as the relay is wanted.
+        """One connection at a time, reconnecting while the relay is wanted.
 
         A dropped stream is normal (server restart, network blip) and must not end an
         endless relay, so the loop says so in chat and reconnects.
         """
-        try:
-            while True:
-                if self._deadline is not None and asyncio.get_running_loop().time() >= self._deadline:
-                    await self._emit("[stream ended: time limit reached]")
-                    return
-                try:
-                    await self._consume_once()
-                    await self._emit("[stream closed by server; reconnecting]")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.warning("stream relay disconnected: %s", e)
-                    await self._emit(f"[stream disconnected: {type(e).__name__}; reconnecting]")
-                await asyncio.sleep(RECONNECT_DELAY_SECONDS)
-        finally:
-            self._buffer.clear()
+        while True:
+            if self._deadline is not None and asyncio.get_running_loop().time() >= self._deadline:
+                await self._emit("[stream ended: time limit reached]")
+                return
+            try:
+                await self._consume_once()
+                await self._emit("[stream closed by server; reconnecting]")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("stream relay disconnected: %s", e)
+                await self._emit(f"[stream disconnected: {type(e).__name__}; reconnecting]")
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
     async def _consume_once(self) -> None:
         """Read one SSE connection to completion (or until the stream ends)."""
@@ -139,101 +128,26 @@ class StreamRelay:
                 await queue.put(None)
 
         reader = asyncio.create_task(read_lines())
-        event_type: str | None = None
-        data_lines: list[str] = []
+        parser = SSEEventParser()
         try:
             while True:
-                # The timeout is what drives flushing: a quiet stream still needs the
-                # pending text pushed out, and cancelling queue.get() is safe (unlike
-                # cancelling an async generator's __anext__).
-                try:
-                    item = await asyncio.wait_for(queue.get(), FLUSH_INTERVAL_SECONDS)
-                except TimeoutError:
-                    await self._flush()
-                    continue
+                item = await queue.get()
                 if item is None:
                     await reader  # surface HTTP/connection errors raised in the reader
                     return
-                if item.startswith("event:"):
-                    event_type, data_lines = item[6:].strip(), []
-                elif item.startswith("data:"):
-                    data_lines.append(item[5:].strip())
-                elif item == "" and event_type:
-                    await self._handle_event(event_type, self._parse(data_lines))
-                    event_type, data_lines = None, []
+                parsed = parser.feed(item)
+                if parsed is not None:
+                    for text in self._policy.feed(*parsed):
+                        await self._emit(text)
         finally:
             reader.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await reader
 
-    @staticmethod
-    def _parse(data_lines: list[str]) -> dict:
-        if not data_lines:
-            return {}
-        try:
-            parsed = json.loads("\n".join(data_lines))
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-
-    # --- event handling ----------------------------------------------------
-
-    async def _handle_event(self, event_type: str, data: dict) -> None:
-        if event_type == "RunStartedEvent":
-            await self._flush()
-            prompt = str(data.get("prompt", "")).strip()
-            if prompt:
-                preview = prompt.replace("\n", " ")[:PROMPT_PREVIEW_CHARS]
-                await self._emit(f"▶ run started: {preview}")
-            else:
-                await self._emit("▶ run started")
-
-        elif event_type == "PartStartEvent":
-            part = data.get("part", {})
-            kind = part.get("part_kind")
-            self._in_thinking = kind == "thinking"
-            if kind == "text" and part.get("content"):
-                self._buffer.append(part["content"])
-
-        elif event_type == "PartDeltaEvent":
-            if not self._in_thinking:
-                delta = data.get("delta", {}).get("content_delta")
-                if delta:
-                    self._buffer.append(delta)
-
-        elif event_type == "PartEndEvent":
-            await self._flush()
-
-        elif "ToolCall" in event_type:
-            await self._flush()
-            part = data.get("part", {})
-            tool_name = part.get("tool_name") or "tool"
-            await self._emit(f"→ {tool_name}")
-
-        elif event_type == "RunCompletedEvent":
-            await self._flush()
-            await self._emit(f"■ run finished ({data.get('status', 'unknown')})")
-
-        elif event_type in ("Error", "RunErrorEvent"):
-            await self._flush()
-            await self._emit(f"⚠ {data.get('message', 'run error')}")
-
-        # Everything else (AgentRunResultEvent, tool results, thinking deltas) is noise
-        # on a phone and is deliberately dropped.
-
-    async def _flush(self) -> None:
-        if not self._buffer:
-            return
-        text = "".join(self._buffer).strip()
-        self._buffer.clear()
-        if text:
-            await self._emit(text)
-
     async def _emit(self, text: str) -> None:
-        # Agent output written for the phone carries <telegram> tags; here the relay *is*
-        # the transport, so the markup would be shown literally. Keep the words, drop the tags.
-        text = TELEGRAM_TAG_RE.sub("", text).strip()
-        if not text or self._suppress():
+        # Operational markers (disconnects, stop confirmations) go through here too: they
+        # are the relay's own voice, not agent output, so the policy must not filter them.
+        if not text.strip() or self._suppress():
             return
         try:
             await self._send(text)

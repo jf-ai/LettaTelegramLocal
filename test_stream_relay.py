@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 import stream_relay
+from output_policy import OutputMode
 from stream_relay import StreamRelay
 
 AGENT_ID = "agent-1"
@@ -18,7 +19,10 @@ def _relay(emitted: list[str], suppress=None) -> StreamRelay:
     async def send(text: str) -> None:
         emitted.append(text)
 
-    return StreamRelay("http://server", AGENT_ID, send=send, suppress=suppress)
+    return StreamRelay(
+        "http://server", AGENT_ID, send=send,
+        mode=lambda: OutputMode.VERBOSE, suppress=suppress,
+    )
 
 
 def _serve(monkeypatch, body: str, status: int = 200) -> dict:
@@ -107,10 +111,7 @@ class TestEventRelay:
         assert emitted == ["Hello"]
 
     def test_unknown_events_are_ignored(self, monkeypatch):
-        _serve(monkeypatch, (
-            'event: AgentRunResultEvent\ndata: {}\n\n'
-            'event: SomethingNew\ndata: {"x": 1}\n\n'
-        ))
+        _serve(monkeypatch, 'event: SomethingNew\ndata: {"x": 1}\n\n')
         emitted: list[str] = []
 
         asyncio.run(_relay(emitted)._consume_once())
