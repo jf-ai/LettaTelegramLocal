@@ -86,8 +86,7 @@ def _timeout_text(acc: _ResponseAccumulator, timeout_seconds: float) -> str:
 
 async def send_message_async(server_url: str, agent_id: str, message: str,
                              timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-                             on_text_delta: Callable[[str], Awaitable[None]] | None = None,
-                             suppress_broadcast: bool = False) -> str:
+                             on_text_delta: Callable[[str], Awaitable[None]] | None = None) -> str:
     """Send a message and return the agent's text response (thinking excluded).
 
     Raises AgentStreamError on hard failures. On timeout, returns partial
@@ -96,18 +95,12 @@ async def send_message_async(server_url: str, agent_id: str, message: str,
     on_text_delta: optional async callback invoked with the full accumulated
     text buffer after each text delta. Enables progressive consumption of
     output mid-run (e.g. the telegram bridge's tag scanner).
-
-    suppress_broadcast: ask the server not to publish this run to the agent's event
-    hub. The caller still receives the same SSE events; other subscribers see nothing.
-    Used by the telegram bridge, whose own turn is delivered through its tag path, so
-    a background stream watcher must not also relay it.
     """
     url = f"{server_url}/agents/{agent_id}/messages"
     acc = _ResponseAccumulator()
     try:
-        headers = {"Suppress-Broadcast": "true"} if suppress_broadcast else None
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            async with client.stream("POST", url, json={"message": message}, headers=headers) as response:
+            async with client.stream("POST", url, json={"message": message}) as response:
                 if response.status_code != 200:
                     detail = (await response.aread()).decode(errors="replace")[:200]
                     raise AgentStreamError(f"HTTP {response.status_code}: {detail}")

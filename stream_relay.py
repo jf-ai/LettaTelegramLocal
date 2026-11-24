@@ -34,12 +34,21 @@ TELEGRAM_TAG_RE = re.compile(r"</?telegram>", re.IGNORECASE)
 class StreamRelay:
     """Forwards one agent's broadcast stream to a chat until stopped.
 
-    send: async callable(text) delivering one logical message (the caller handles
-          platform limits and its own formatting).
+    send:      async callable(text) delivering one logical message (the caller handles
+               platform limits and its own formatting).
+    suppress:  callable returning True while the bridge is itself running a turn; the
+               relay then drops output, because that run is already being delivered
+               through the normal reply path and would otherwise arrive twice.
 
-    Runs this bridge starts itself never appear here: it sends them with
-    Suppress-Broadcast, so they are not published to the hub at all. Nothing needs to be
-    filtered after the fact.
+               TODO: a client-side stand-in for per-run suppression. The obvious
+               alternative — POST /messages with Suppress-Broadcast — is worse than it
+               looks: it hides the run from the whole hub, so a Telegram-initiated run
+               also vanishes from the Nori/ACP session watching the same agent, and
+               seeing the agent work from either side is the point of this relay. The
+               real fix is suppress-by-broadcast-id: the bridge marks its own run and
+               subscribers filter that id, so every other subscriber still sees it. Needs
+               server support (an id on RunStartedEvent plus a request-side marker), so
+               it is parked until there is a second consumer that cares.
     """
 
     def __init__(
@@ -47,10 +56,12 @@ class StreamRelay:
         server_url: str,
         agent_id: str,
         send: Callable[[str], Awaitable[None]],
+        suppress: Callable[[], bool] | None = None,
     ) -> None:
         self._server_url = server_url
         self._agent_id = agent_id
         self._send = send
+        self._suppress = suppress or (lambda: False)
         self._task: asyncio.Task | None = None
         self._deadline: float | None = None
         self._buffer: list[str] = []
@@ -222,7 +233,7 @@ class StreamRelay:
         # Agent output written for the phone carries <telegram> tags; here the relay *is*
         # the transport, so the markup would be shown literally. Keep the words, drop the tags.
         text = TELEGRAM_TAG_RE.sub("", text).strip()
-        if not text:
+        if not text or self._suppress():
             return
         try:
             await self._send(text)

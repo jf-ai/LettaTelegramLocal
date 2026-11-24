@@ -14,11 +14,11 @@ from stream_relay import StreamRelay
 AGENT_ID = "agent-1"
 
 
-def _relay(emitted: list[str]) -> StreamRelay:
+def _relay(emitted: list[str], suppress=None) -> StreamRelay:
     async def send(text: str) -> None:
         emitted.append(text)
 
-    return StreamRelay("http://server", AGENT_ID, send=send)
+    return StreamRelay("http://server", AGENT_ID, send=send, suppress=suppress)
 
 
 def _serve(monkeypatch, body: str, status: int = 200) -> dict:
@@ -79,6 +79,20 @@ class TestEventRelay:
         asyncio.run(_relay(emitted)._consume_once())
 
         assert emitted == ["⚠ boom"]
+
+    def test_suppressed_run_is_not_relayed(self, monkeypatch):
+        """Runs this bridge started itself are already delivered via the tag path."""
+        _serve(monkeypatch, (
+            'event: RunStartedEvent\ndata: {"prompt": "hi"}\n\n'
+            'event: PartStartEvent\ndata: {"part": {"part_kind": "text", "content": "hello"}}\n\n'
+            'event: PartEndEvent\ndata: {}\n\n'
+            'event: RunCompletedEvent\ndata: {"status": "success"}\n\n'
+        ))
+        emitted: list[str] = []
+
+        asyncio.run(_relay(emitted, suppress=lambda: True)._consume_once())
+
+        assert emitted == []
 
     def test_telegram_tag_markup_is_stripped(self, monkeypatch):
         """TUI output is written for the phone; the relay must not show the XML."""
