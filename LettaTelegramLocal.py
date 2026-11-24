@@ -60,6 +60,7 @@ MESSAGE_TIMEOUT_SECONDS = 480  # agent runs can be long (agentic tool use)
 ALERT_TIMEOUT_SECONDS = 120   # alerts: best-effort, don't block callers as long
 AGENT_ID = None               # resolved at startup from the agent registry
 bridge_run_active = False     # True while this bridge's own turn is in flight
+user_turn_active = False      # True while handle_message is running a chat turn
 stream_relay: StreamRelay | None = None   # background relay started by /stream_on
 
 # Session state (clears on restart)
@@ -378,13 +379,26 @@ async def handle_message(update: Update, context):
         await update.message.reply_text("Please connect first with /start")
         return
 
+    global user_turn_active
+    # Updates are processed concurrently (so /cancel and /stream_off can land mid-run),
+    # which means a second message can arrive while a turn is still running. Queueing is
+    # no longer automatic, and the server would answer 423 Locked — say what is happening
+    # instead of surfacing a raw HTTP error.
+    if user_turn_active:
+        await update.message.reply_text("Still working on the previous message — /cancel to interrupt.")
+        return
+
     user_message = update.message.text
 
     first_of_session = user_id not in briefed_users
     briefed_users.add(user_id)
     formatted_message = format_incoming_message(user_message, first_of_session)
 
-    result = await send_message(formatted_message, bot=context.bot, chat_id=update.message.chat_id)
+    user_turn_active = True
+    try:
+        result = await send_message(formatted_message, bot=context.bot, chat_id=update.message.chat_id)
+    finally:
+        user_turn_active = False
 
     if result["success"]:
         opus_response = result["result"]
@@ -406,7 +420,13 @@ async def handle_message(update: Update, context):
             # (distinguishes "agent chose not to send" from "bridge died").
             await update.message.reply_text("[no tagged response — full output in LC/Nori]")
     else:
-        await update.message.reply_text(f"Error: {result['result']}")
+        # 423 Locked = another run holds the agent (e.g. one started in the TUI, which
+        # this bridge's own flag cannot see). Say what it means; /cancel works on it.
+        detail = result["result"]
+        if "HTTP 423" in detail:
+            await update.message.reply_text("The agent is busy with another run — /cancel to interrupt it.")
+        else:
+            await update.message.reply_text(f"Error: {detail}")
 
 async def send_chat_text(bot, chat_id: int, text: str) -> None:
     """Send bridge-authored text to a chat, respecting Telegram's per-message limit."""
