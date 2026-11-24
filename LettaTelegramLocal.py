@@ -434,6 +434,9 @@ def _auth_required(handler):
         if await _is_authenticated(update):
             await handler(update, context)
 
+    # Explicit marker: __wrapped__ is set by any functools.wraps decorator, so it cannot
+    # distinguish this gate from a logging wrapper. test_auth_gating.py looks for this.
+    wrapper.__auth_gated__ = True
     return wrapper
 
 

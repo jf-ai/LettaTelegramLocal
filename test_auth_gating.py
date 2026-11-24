@@ -32,19 +32,20 @@ def _update(user_id: int) -> SimpleNamespace:
     return SimpleNamespace(effective_user=SimpleNamespace(id=user_id), message=_FakeMessage())
 
 
-def test_every_handler_except_start_is_gated():
+def test_only_start_is_registered_ungated():
+    """One ungated handler, and it is /start itself — by identity, not by name.
+
+    Stated as a property rather than an expected table of handlers: a new handler joins
+    the app without touching this test (it must be gated, or this fails), and there is no
+    slot in which to record "this one is allowed to be ungated". The exemption is the
+    start *function*, so a differently-named callback called "start" does not qualify.
+    """
     app = bridge.build_application()
     handlers = [handler for group in app.handlers.values() for handler in group]
 
-    gated = {handler.callback.__name__: hasattr(handler.callback, "__wrapped__") for handler in handlers}
+    ungated = [handler.callback for handler in handlers if not getattr(handler.callback, "__auth_gated__", False)]
 
-    assert gated == {
-        "start": False,          # the way in — it cannot sit behind the gate
-        "stream_on": True,
-        "stream_off": True,
-        "cancel_run": True,
-        "handle_message": True,
-    }
+    assert ungated == [bridge.start], f"ungated handlers: {[cb.__qualname__ for cb in ungated]}"
 
 
 class TestGateBehaviour:
