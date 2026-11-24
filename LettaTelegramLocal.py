@@ -60,7 +60,6 @@ ALLOWED_USER_IDS = [int(AUTHORIZED_USER)]
 MESSAGE_TIMEOUT_SECONDS = 480  # agent runs can be long (agentic tool use)
 ALERT_TIMEOUT_SECONDS = 120   # alerts: best-effort, don't block callers as long
 AGENT_ID = None               # resolved at startup from the agent registry
-bridge_run_active = False     # True while this bridge's own turn is in flight
 user_turn_active = False      # True while handle_message is running a chat turn
 stream_relay: StreamRelay | None = None   # background relay started by /stream_on
 
@@ -199,15 +198,15 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
     async def on_text_delta(buffer: str) -> None:
         await tag_sender.scan(buffer)
 
-    global bridge_run_active
     try:
-        # Mark our own run: /stream_on relays *other* clients' runs, and this turn is
-        # already being delivered through the tag path — relaying it too would duplicate
-        # every line on the phone.
-        bridge_run_active = True
+        # Suppress-Broadcast: this turn is delivered through the tag path, so it must not
+        # also reach /stream_on's relay. Asking the server not to publish it is the
+        # intended path — the alternative (filtering our own events out of the relay)
+        # would need bridge-wide state to tell "ours" from "another client's".
         text = await send_message_async(
             SERVER_URL, AGENT_ID, message, MESSAGE_TIMEOUT_SECONDS,
             on_text_delta=on_text_delta if tag_sender else None,
+            suppress_broadcast=True,
         )
         return {
             "success": True,
@@ -216,8 +215,6 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
         }
     except AgentStreamError as e:
         return {"success": False, "result": str(e), "updates_sent": 0}
-    finally:
-        bridge_run_active = False
 
 
 async def send_alert_to_opus(message: str):
@@ -227,7 +224,7 @@ async def send_alert_to_opus(message: str):
     run completes server-side (dropping the connection mid-run could cancel it).
     """
     try:
-        await send_message_async(SERVER_URL, AGENT_ID, message, ALERT_TIMEOUT_SECONDS)
+        await send_message_async(SERVER_URL, AGENT_ID, message, ALERT_TIMEOUT_SECONDS, suppress_broadcast=True)
     except AgentStreamError as e:
         print(f"[{AGENT_NAME}] Alert delivery failed: {e}")
 
@@ -465,8 +462,8 @@ async def stream_on(update: Update, context):
     """Watch this agent's background runs. /stream_on [minutes] — endless by default.
 
     "Background" means runs this bridge didn't start: a TUI session, another client.
-    Runs started through Telegram are already delivered through the tag path and are
-    suppressed in the relay to avoid duplicate messages.
+    Runs started through Telegram never arrive here — they are sent with
+    Suppress-Broadcast, so the server does not publish them to the hub at all.
     """
     global stream_relay
     minutes: float | None = None
@@ -489,7 +486,6 @@ async def stream_on(update: Update, context):
         SERVER_URL,
         AGENT_ID,
         send=lambda text: send_chat_text(context.bot, chat_id, text),
-        suppress=lambda: bridge_run_active,
     )
     stream_relay.start(minutes)
 
