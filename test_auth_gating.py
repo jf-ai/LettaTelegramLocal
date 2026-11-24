@@ -189,3 +189,16 @@ class TestFailedAttemptTripwire:
         self._send_wrong_password()
 
         assert bridge.failed_auth_attempts == 1
+
+
+def test_main_starts_polling_with_a_clean_backlog(monkeypatch):
+    """A restarted bridge must not replay updates sent while it was down: stale messages
+    are answered too late, and a backlog of failed /start attempts would trip the kill
+    switch before the operator can type."""
+    captured: dict = {}
+    monkeypatch.setattr(bridge.asyncio, "run", lambda coro: (coro.close(), "agent-1")[1])
+    monkeypatch.setattr(bridge.Application, "run_polling", lambda self, **kwargs: captured.update(kwargs))
+
+    bridge.main()
+
+    assert captured == {"drop_pending_updates": True}

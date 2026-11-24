@@ -644,8 +644,16 @@ def main():
     else:
         print(f"[{AGENT_NAME}] Bot running with polling... Pings disabled")
 
-    # run_polling() starts the event loop and blocks forever
-    app.run_polling()
+    # run_polling() starts the event loop and blocks forever.
+    #
+    # drop_pending_updates: Telegram keeps unconfirmed updates and a restarted process
+    # fetches them from its last offset, so a bridge that was down for a while replays
+    # everything sent in the meantime. Two reasons that is wrong here: a reply to a
+    # twenty-minute-old message is worse than silence, and — since each replayed /start
+    # counts as a failed attempt against a fresh counter — a backlog of five can trip the
+    # auth kill switch immediately on startup, locking the bridge out before the operator
+    # can type. Fresh start, no backlog.
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
