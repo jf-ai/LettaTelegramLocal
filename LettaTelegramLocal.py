@@ -79,8 +79,8 @@ class BridgeState:
     """
 
     agent_id: str                     # resolved once from the registry; read-only after
-    authenticated: set[int] = field(default_factory=set)
-    briefed: set[int] = field(default_factory=set)
+    authenticated_users: set[int] = field(default_factory=set)
+    briefed_users: set[int] = field(default_factory=set)
     failed_auth_attempts: int = 0     # consecutive wrong passwords; only the authorized
                                       # account can raise it (is_known_user gates /start)
     verbose_mode: str = OutputMode.TAGS
@@ -265,7 +265,7 @@ async def parse_and_execute_commands(opus_response: str, context, state: BridgeS
     message_match = re.search(r'^\s*MESSAGE_JAMES\s*["\'](.+?)["\']\s*$', opus_response, re.IGNORECASE | re.MULTILINE | re.DOTALL)
     if message_match:
         target_user_id = int(AUTHORIZED_USER)
-        if target_user_id not in state.authenticated:
+        if target_user_id not in state.authenticated_users:
             await send_alert_to_opus("[MESSAGE_JAMES FAILED] User has not authenticated yet (/start). Message not sent.", state)
             executed["MESSAGE_JAMES"] = {"status": "failed", "reason": "user_not_authenticated"}
             print(f"[{AGENT_NAME}] MESSAGE_JAMES blocked: user {target_user_id} not authenticated")
@@ -396,8 +396,8 @@ async def handle_message(update: Update, context, state: BridgeState):
 
     user_message = update.message.text
 
-    first_of_session = user_id not in state.briefed
-    state.briefed.add(user_id)
+    first_of_session = user_id not in state.briefed_users
+    state.briefed_users.add(user_id)
     formatted_message = format_incoming_message(user_message, first_of_session)
 
     state.user_turn_active = True
@@ -478,7 +478,7 @@ async def _is_authenticated(update: Update, state: BridgeState) -> bool:
     user_id = update.effective_user.id
     if not is_known_user(user_id):
         return False
-    if user_id not in state.authenticated:
+    if user_id not in state.authenticated_users:
         await update.message.reply_text("Please connect first with /start")
         return False
     return True
@@ -589,8 +589,8 @@ async def start(update: Update, context, state: BridgeState):
 
     # Correct password
     state.failed_auth_attempts = 0
-    state.authenticated.add(user_id)
-    state.briefed.discard(user_id)  # re-auth re-briefs: guide arrives with next message
+    state.authenticated_users.add(user_id)
+    state.briefed_users.discard(user_id)  # re-auth re-briefs: guide arrives with next message
     await update.message.reply_text(f"Connected to {AGENT_NAME}! Send me a message.")
 
 

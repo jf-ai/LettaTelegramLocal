@@ -107,7 +107,7 @@ class TestGateBehaviour:
 
         user_id = bridge.ALLOWED_USER_IDS[0]
         state = _state()
-        state.authenticated.add(user_id)
+        state.authenticated_users.add(user_id)
         update = _update(user_id)
 
         asyncio.run(bridge._auth_required(handler, state)(update, None))

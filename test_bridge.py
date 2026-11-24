@@ -119,7 +119,7 @@ def make_context(bot, job_queue=None, job=None, application=None):
 async def test_commands():
     bot = FakeBot()
     state = bridge.BridgeState(agent_id="agent-1")
-    state.authenticated.add(int(bridge.AUTHORIZED_USER))
+    state.authenticated_users.add(int(bridge.AUTHORIZED_USER))
 
     response = (
         "Some intro text.\n"
@@ -199,7 +199,7 @@ async def test_tag_progressive_live(agent_id):
     """Live: agent wraps output in tags → sent progressively, updates_sent=1."""
     bridge.SERVER_URL = SERVER_URL
     state = bridge.BridgeState(agent_id=agent_id)
-    state.authenticated.add(int(bridge.AUTHORIZED_USER))
+    state.authenticated_users.add(int(bridge.AUTHORIZED_USER))
     bot = FakeBot()
     chat_id = int(bridge.AUTHORIZED_USER)
 
