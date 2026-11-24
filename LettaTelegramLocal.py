@@ -15,6 +15,7 @@ Configuration via .env:
 """
 
 import asyncio
+import functools
 import os
 import re
 
@@ -143,7 +144,7 @@ def parse_interval(interval_str: str) -> int | None:
     return None
 
 # TODO: We have a lot of auth checks around that should be commonized
-def is_authorized_user(id: int):
+def is_known_user(id: int):
     return id in ALLOWED_USER_IDS
 
 
@@ -372,13 +373,6 @@ async def periodic_ping(context):
 async def handle_message(update: Update, context):
     user_id = update.effective_user.id
 
-    if not is_authorized_user(user_id):
-        return
-
-    if user_id not in authenticated_users:
-        await update.message.reply_text("Please connect first with /start")
-        return
-
     global user_turn_active
     # Updates are processed concurrently (so /cancel and /stream_off can land mid-run),
     # which means a second message can arrive while a turn is still running. Queueing is
@@ -428,20 +422,38 @@ async def handle_message(update: Update, context):
         else:
             await update.message.reply_text(f"Error: {detail}")
 
+def _auth_required(handler):
+    """Gate a handler behind _is_authenticated — applied at registration, in one place.
+
+    Every handler except /start (the way in) is registered through this. A per-handler
+    guard is a per-handler chance to forget it or to write it slightly differently, and
+    this bridge is the most exposed surface Agent Home has: anyone who finds the bot can
+    send commands, so /cancel and /stream_on must not be one omission away from open.
+    tests/test_auth_gating.py fails if a handler is ever registered ungated.
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context):
+        if await _is_authenticated(update):
+            await handler(update, context)
+
+    return wrapper
+
+
 async def send_chat_text(bot, chat_id: int, text: str) -> None:
     """Send bridge-authored text to a chat, respecting Telegram's per-message limit."""
     for chunk in _chunk(text, TELEGRAM_CHUNK_LIMIT):
         await bot.send_message(chat_id=chat_id, text=chunk)
 
 
-async def _require_authenticated(update: Update) -> bool:
-    """Shared gate for handlers: authorized user AND completed /start.
+async def _is_authenticated(update: Update) -> bool:
+    """Is this a known user who has completed /start?
 
-    Unauthorized users are dropped silently (no reply, no information); known users who
-    haven't authenticated are told how.
+    Unknown users are dropped silently (no reply, no information); known users who have
+    not authenticated are told how.
     """
     user_id = update.effective_user.id
-    if not is_authorized_user(user_id):
+    if not is_known_user(user_id):
         return False
     if user_id not in authenticated_users:
         await update.message.reply_text("Please connect first with /start")
@@ -457,9 +469,6 @@ async def stream_on(update: Update, context):
     suppressed in the relay to avoid duplicate messages.
     """
     global stream_relay
-    if not await _require_authenticated(update):
-        return
-
     minutes: float | None = None
     if context.args:
         try:
@@ -490,8 +499,7 @@ async def stream_on(update: Update, context):
 
 async def stream_off(update: Update, context):
     """Stop the background relay. The agent's run keeps going."""
-    if not await _require_authenticated(update):
-        return
+
     if stream_relay is None or not stream_relay.is_running:
         await update.message.reply_text("No stream is running.")
         return
@@ -505,8 +513,7 @@ async def cancel_run(update: Update, context):
     processed concurrently (see main); otherwise this command could not land mid-run,
     which is the only time it is useful.
     """
-    if not await _require_authenticated(update):
-        return
+
     try:
         accepted = await cancel_agent_run_async(SERVER_URL, AGENT_ID)
     except AgentStreamError as e:
@@ -521,7 +528,7 @@ async def cancel_run(update: Update, context):
 async def start(update: Update, context):
     user_id = update.effective_user.id
 
-    if not is_authorized_user(user_id):
+    if not is_known_user(user_id):
         return
 
     # Scrub the /start message (it contains a password — attempt or real) from
@@ -546,6 +553,36 @@ async def start(update: Update, context):
     await update.message.reply_text(f"Connected to {AGENT_NAME}! Send me a message.")
 
 
+def build_application() -> Application:
+    """Build the Application and register handlers — no polling, no agent lookup.
+
+    Separated from main() so the handler wiring (and its auth gating) can be asserted
+    without starting a bot.
+    """
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    if TELEGRAM_API_BASE_URL:
+        builder = builder.base_url(TELEGRAM_API_BASE_URL)  # testing hook: fake Bot API
+    # Concurrent updates are required, not cosmetic: a turn can hold for minutes while the
+    # agent works, and /cancel and /stream_off are only useful if they land *during* it.
+    # With the default (one update at a time) they would queue until the run finished.
+    app = builder.concurrent_updates(True).build()
+
+    # Every handler except /start (the authentication entry point) goes through
+    # _auth_required. Keep the gate visible in this one block; do not hand a bare callback
+    # to add_handler below this line.
+    app.add_handler(CommandHandler("start", start))
+    for handler in (
+        CommandHandler("stream_on", stream_on),
+        CommandHandler("stream_off", stream_off),
+        CommandHandler("cancel", cancel_run),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
+    ):
+        handler.callback = _auth_required(handler.callback)
+        app.add_handler(handler)
+
+    return app
+
+
 def main():
     global ping_job, AGENT_ID
 
@@ -554,18 +591,7 @@ def main():
     AGENT_ID = asyncio.run(resolve_agent_id_by_name_async(SERVER_URL, AGENT_NAME))
     print(f"[{AGENT_NAME}] Connected to agent ({AGENT_ID}) at {SERVER_URL}")
 
-    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
-    if TELEGRAM_API_BASE_URL:
-        builder = builder.base_url(TELEGRAM_API_BASE_URL)  # testing hook: fake Bot API
-    # Concurrent updates are required, not cosmetic: a turn can hold for minutes while the
-    # agent works, and /cancel and /stream_off are only useful if they land *during* it.
-    # With the default (one update at a time) they would queue until the run finished.
-    app = builder.concurrent_updates(True).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stream_on", stream_on))
-    app.add_handler(CommandHandler("stream_off", stream_off))
-    app.add_handler(CommandHandler("cancel", cancel_run))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app = build_application()
 
     # Schedule the periodic ping using JobQueue (if enabled)
     # JobQueue is built into python-telegram-bot — it manages scheduled tasks
