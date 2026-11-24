@@ -16,6 +16,9 @@ os.environ.setdefault("AGENT_NAME", "probe_agent")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN_PROBE_AGENT", "123:test")
 os.environ.setdefault("AUTHORIZED_USER", "4242")
 os.environ.setdefault("SKIP_FIRST_PING", "True")
+os.environ.setdefault("TELEGRAM_PASSWORD", "correct-horse")
+
+import pytest  # noqa: E402
 
 import LettaTelegramLocal as bridge  # noqa: E402  (must follow the env setup)
 
@@ -92,3 +95,95 @@ class TestGateBehaviour:
 
         assert calls == ["ran"]
         assert update.message.replies == []
+
+
+class _FakeBot:
+    def __init__(self) -> None:
+        self.sent: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id: int, text: str) -> None:
+        self.sent.append((chat_id, text))
+
+
+class _FakeApplication:
+    def __init__(self) -> None:
+        self.stopped = 0
+
+    def stop_running(self) -> None:
+        self.stopped += 1
+
+
+class _DeleteableMessage(_FakeMessage):
+    chat_id = None
+
+    async def delete(self) -> None:
+        pass
+
+
+def _auth_update(user_id: int, chat_id: int, text_args: list[str] | None) -> SimpleNamespace:
+    message = _DeleteableMessage()
+    message.chat_id = chat_id
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        message=message,
+        args=text_args,
+        bot=_FakeBot(),
+        application=_FakeApplication(),
+    )
+
+
+class TestFailedAttemptTripwire:
+    """Repeated wrong passwords take the bridge down. Only the authorized account can
+    reach the failure branch at all, so this is a tripwire for a compromised session
+    rather than a DoS lever a stranger could pull."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_counter(self):
+        bridge.failed_auth_attempts = 0
+        yield
+        bridge.failed_auth_attempts = 0
+
+    def _fail(self, attempts: int, chat_id: int = None) -> SimpleNamespace:
+        update = None
+        for _ in range(attempts):
+            update = self._send_wrong_password(chat_id)
+        return update
+
+    def _send_wrong_password(self, chat_id: int = None) -> SimpleNamespace:
+        update = _auth_update(bridge.ALLOWED_USER_IDS[0], chat_id or bridge.ALLOWED_USER_IDS[0], ["wrong"])
+        asyncio.run(bridge.start(update, update))
+        return update
+
+    def test_four_failures_leave_the_bridge_running(self):
+        update = self._fail(4)
+
+        assert update.application.stopped == 0
+
+    def test_fifth_failure_stops_the_bridge_and_says_why(self):
+        update = self._fail(5)
+
+        assert update.application.stopped == 1
+        chat_id, text = update.bot.sent[-1]
+        assert chat_id == int(bridge.AUTHORIZED_USER)
+        assert text == "[SECURITY] 5 failed /start attempts on this bridge. Shutting down — restart manually when safe."
+
+    def test_notice_never_goes_to_the_chat_that_triggered_it(self):
+        """The whole point: a notice about an attacker must not be addressed from the
+        attacker's own message, or it is delivered to them."""
+        attacker_chat = 999_999
+        update = self._fail(5, chat_id=attacker_chat)
+
+        addressed = [chat_id for chat_id, _ in update.bot.sent]
+
+        assert attacker_chat not in addressed
+
+    def test_successful_auth_resets_the_count(self):
+        self._fail(4)
+
+        ok = _auth_update(bridge.ALLOWED_USER_IDS[0], bridge.ALLOWED_USER_IDS[0], ["correct-horse"])
+        asyncio.run(bridge.start(ok, ok))
+
+        assert bridge.failed_auth_attempts == 0
+        self._send_wrong_password()
+
+        assert bridge.failed_auth_attempts == 1

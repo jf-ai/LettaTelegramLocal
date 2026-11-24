@@ -59,6 +59,7 @@ ALLOWED_USER_IDS = [int(AUTHORIZED_USER)]
 # Agent Home communication
 MESSAGE_TIMEOUT_SECONDS = 480  # agent runs can be long (agentic tool use)
 ALERT_TIMEOUT_SECONDS = 120   # alerts: best-effort, don't block callers as long
+MAX_FAILED_AUTH_ATTEMPTS = 5  # tripwire, not a rate limit — see start()
 AGENT_ID = None               # resolved at startup from the agent registry
 bridge_run_active = False     # True while this bridge's own turn is in flight.
 # Read by StreamRelay.suppress to keep our own turn out of the background relay; see the
@@ -69,6 +70,8 @@ stream_relay: StreamRelay | None = None   # background relay started by /stream_
 
 # Session state (clears on restart)
 authenticated_users = set()
+failed_auth_attempts = 0  # consecutive wrong passwords this session; only the authorized
+                          # account can raise it (is_known_user gates /start first)
 briefed_users = set()  # users who've received the telegram guide this session
 
 TELEGRAM_GUIDE = """[TELEGRAM BRIDGE GUIDE — first message of this session]
@@ -221,6 +224,30 @@ async def send_message(message: str, bot=None, chat_id: int | None = None) -> di
         return {"success": False, "result": str(e), "updates_sent": 0}
     finally:
         bridge_run_active = False
+
+
+async def shutdown_after_failed_attempts(context, attempts: int) -> None:
+    """Take the bridge down after repeated wrong passwords from the authorized account.
+
+    This cannot be tripped by a stranger: /start returns before this branch unless the
+    sender already *is* the authorized user. So repeated failure means the account is in
+    someone else's hands (or the operator is guessing badly), and down is the safe state —
+    restarting becomes a deliberate act.
+
+    The notice goes to int(AUTHORIZED_USER) from configuration, never to a chat id taken
+    from the attempt that triggered it: an address supplied by the event is an address the
+    attacker controls, and this message is about them.
+    """
+    print(f"[{AGENT_NAME}] {attempts} failed authentication attempts — shutting down Telegram bridge")
+    try:
+        await context.bot.send_message(
+            chat_id=int(AUTHORIZED_USER),
+            text=(f"[SECURITY] {attempts} failed /start attempts on this bridge. "
+                  "Shutting down — restart manually when safe."),
+        )
+    except TelegramError as e:
+        print(f"[{AGENT_NAME}] Shutdown notice failed to send: {e}")
+    context.application.stop_running()
 
 
 async def send_alert_to_opus(message: str):
@@ -532,6 +559,8 @@ async def cancel_run(update: Update, context):
 
 
 async def start(update: Update, context):
+    global failed_auth_attempts
+
     user_id = update.effective_user.id
 
     if not is_known_user(user_id):
@@ -549,11 +578,15 @@ async def start(update: Update, context):
     if not context.args or context.args[0] != TELEGRAM_PASSWORD:
         # Only alert me if they actually tried a password (not just /start alone)
         if context.args:
+            failed_auth_attempts += 1
             await send_alert_to_opus(f"[SECURITY ALERT via Telegram] Failed authentication attempt from user ID: {user_id}")
+            if failed_auth_attempts >= MAX_FAILED_AUTH_ATTEMPTS:
+                await shutdown_after_failed_attempts(context, failed_auth_attempts)
         await update.message.reply_text("Hmm, I don't understand. Please try again?")
         return
 
     # Correct password
+    failed_auth_attempts = 0
     authenticated_users.add(user_id)
     briefed_users.discard(user_id)  # re-auth re-briefs: guide arrives with next message
     await update.message.reply_text(f"Connected to {AGENT_NAME}! Send me a message.")
