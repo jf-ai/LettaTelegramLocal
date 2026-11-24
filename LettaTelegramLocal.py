@@ -98,9 +98,13 @@ class BridgeState:
     ping_job: object | None = None
 
 
-TELEGRAM_GUIDE = """[TELEGRAM BRIDGE GUIDE — first message of this session]
-
-How replies work from here:
+# What the agent is told about delivery, per mode. This must match what the policy
+# actually does: an agent that believes its prose is private will write things it would
+# not otherwise write, which is exactly the failure mode worth preventing. The two
+# variants share everything except the delivery rules, so the differences are visible
+# side by side.
+DELIVERY_RULES = {
+    OutputMode.TAGS: """How replies work from here:
 - ONLY content you wrap in <telegram>...</telegram> tags is sent to James's phone —
   delivered the MOMENT the tag closes.
   - Use tags for: immediate acks, progress updates during long tool-using runs,
@@ -108,31 +112,52 @@ How replies work from here:
   - Untagged text stays PRIVATE (he never sees it).
   - NO tags in your response = NOTHING is sent (you'll get a "no tagged response"
     marker on his phone). Always tag what you want delivered.
-- Tags are delivered progressively as they close — multiple tags = multiple updates.
+- Tags are delivered progressively as they close — multiple tags = multiple updates.""",
+    OutputMode.VERBOSE: """How replies work from here (VERBOSE MODE IS ON):
+- EVERYTHING you write is delivered to James's phone: each block of assistant text as one
+  message, plus tool calls and a short preview of tool results as they happen.
+  - Untagged text is NOT private. If you don't want him to read it, don't write it.
+  - <telegram> tags are unnecessary now and are stripped, not delivered twice.
+  - Thinking is never sent.
+- He can switch modes at any time; the header on each message tells you which is active.""",
+}
 
-Commands (each on its own line in your response):
+TELEGRAM_GUIDE_PREFIX = "[TELEGRAM BRIDGE GUIDE — first message of this session]"
+
+TELEGRAM_COMMANDS_GUIDE = """Commands (each on its own line in your response):
 - MESSAGE_JAMES "text"   — send him a message (mainly for autonomous time)
 - SET_INTERVAL "2 hours" — change self-wake ping frequency
 - STOP                   — cancel self-wake pings
-- KILL_TELEGRAM          — emergency: kill the telegram bridge (security concerns)
+- KILL_TELEGRAM          — emergency: kill the telegram bridge (security concerns)"""
 
-You have your full toolset and permissions here — telegram is a complete door, not a limited one."""
+TELEGRAM_GUIDE_SUFFIX = """You have your full toolset and permissions here — telegram is a complete door, not a limited one."""
 
-# Combined channel + tag-reminder in ONE bracket line — stacked bracket headers
+# Combined channel + delivery reminder in ONE bracket line — stacked bracket headers
 # were a demonstrated parsing hazard for the agent reading them (Oct 14 field notes).
-TELEGRAM_HEADER = "[via Telegram: wrap sends in <telegram>tags</telegram> — untagged = private, no tags = nothing sent]"
+# Per mode, because the reminder is a claim about what happens to the text.
+TELEGRAM_HEADERS = {
+    OutputMode.TAGS: "[via Telegram: wrap sends in <telegram>tags</telegram> — untagged = private, no tags = nothing sent]",
+    OutputMode.VERBOSE: "[via Telegram: VERBOSE — everything you write reaches his phone; tags optional and stripped; nothing here is private]",
+}
 
 
-def format_incoming_message(user_message: str, include_guide: bool) -> str:
+def format_incoming_message(user_message: str, include_guide: bool, verbose: bool) -> str:
     """Format an incoming telegram message for the agent.
 
     First message of a session includes the full bridge guide (channel-labeled);
-    subsequent messages carry the combined channel + tag-reminder header. The
+    subsequent messages carry the combined channel + delivery-reminder header. The
     user's message always starts on a fresh line after the header.
+
+    verbose is read fresh on every message rather than remembered: the mode can change
+    mid-session, and the header is the agent's only signal that its privacy did too.
     """
+    mode = OutputMode.VERBOSE if verbose else OutputMode.TAGS
     if include_guide:
-        return f"{TELEGRAM_GUIDE}\n\n[via Telegram]\n{user_message}"
-    return f"{TELEGRAM_HEADER}\n{user_message}"
+        guide = "\n\n".join([
+            TELEGRAM_GUIDE_PREFIX, DELIVERY_RULES[mode], TELEGRAM_COMMANDS_GUIDE, TELEGRAM_GUIDE_SUFFIX,
+        ])
+        return f"{guide}\n\n[via Telegram]\n{user_message}"
+    return f"{TELEGRAM_HEADERS[mode]}\n{user_message}"
 
 
 
@@ -404,7 +429,11 @@ async def handle_message(update: Update, context, state: BridgeState):
 
     first_of_session = user_id not in state.briefed_users
     state.briefed_users.add(user_id)
-    formatted_message = format_incoming_message(user_message, first_of_session)
+    formatted_message = format_incoming_message(
+        user_message,
+        include_guide=first_of_session,
+        verbose=state.verbose_mode == OutputMode.VERBOSE,
+    )
 
     state.user_turn_active = True
     try:

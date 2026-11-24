@@ -149,14 +149,14 @@ async def test_format_incoming_message():
     Message always on a fresh line after the header."""
     msg = "Hello from telegram"
 
-    first = bridge.format_incoming_message(msg, include_guide=True)
+    first = bridge.format_incoming_message(msg, include_guide=True, verbose=False)
     assert first.startswith("[TELEGRAM BRIDGE GUIDE"), first[:50]
     assert "<telegram>...</telegram>" in first, "guide must document the tags"
     assert "KILL_TELEGRAM" in first and "MESSAGE_JAMES" in first
     assert f"[via Telegram]\n{msg}" in first, "header + message on fresh line"
     print("[PASS] first-message format: guide included, message on own line")
 
-    later = bridge.format_incoming_message(msg, include_guide=False)
+    later = bridge.format_incoming_message(msg, include_guide=False, verbose=False)
     assert later.startswith("[via Telegram: wrap sends in"), later[:60]
     assert "untagged = private, no tags = nothing sent" in later, "reminder content in the combined header"
     assert later.count("\n[") == 0, "exactly ONE bracket line — stacked brackets are a parsing hazard"
