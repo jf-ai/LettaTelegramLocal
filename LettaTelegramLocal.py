@@ -595,25 +595,31 @@ async def help_cmd(update: Update, context):
 class BridgeCommand:
     """One inbound command: what to register, what to call, what to say about it.
 
-    This is the single declaration build_application() iterates and /help renders, so a
-    command cannot exist in the help text without being registered (or vice versa). The
-    test in test_auth_gating.py asserts that correspondence, because a registry that can
-    drift from the real registrations is just a second source of truth.
+    Commands are declared in two lists rather than carrying an "is this gated?" flag:
+    /start authenticates a session, so it cannot sit behind the auth gate, and that is a
+    structural fact about it rather than a field somebody can flip by accident. The
+    registry below is what build_application() registers and what /help renders, so a
+    command cannot appear in help without being registered (test_auth_gating.py asserts
+    the correspondence in both directions).
     """
 
     name: str
     handler: Callable
     description: str
-    gated: bool = True   # False only for /start, which must run before authentication
 
 
-COMMANDS: tuple[BridgeCommand, ...] = (
-    BridgeCommand("start", start, "connect with your password", gated=False),
+# The way in. Ungated by necessity: it is how a session authenticates.
+START_CMD = BridgeCommand("start", start, "connect with your password")
+
+# Everything else runs behind the auth gate, automatically, by virtue of living here.
+AUTH_GATED_CMDS: tuple[BridgeCommand, ...] = (
     BridgeCommand("help", help_cmd, "list these commands"),
     BridgeCommand("verbose", set_verbose, "on|off (all output and tool calls, or only tagged content)"),
     BridgeCommand("background_stream", background_stream, "on|off (watch runs started by other clients, e.g. a TUI)"),
     BridgeCommand("cancel", cancel_run, "cancel the agent's in-flight run (any client's)"),
 )
+
+COMMANDS: tuple[BridgeCommand, ...] = (START_CMD,) + AUTH_GATED_CMDS
 
 
 def build_application() -> Application:
@@ -630,11 +636,11 @@ def build_application() -> Application:
     # With the default (one update at a time) they would queue until the run finished.
     app = builder.concurrent_updates(True).build()
 
-    # Every command is declared once, in COMMANDS, and registered from it. /start is the
-    # only ungated one: it is how a session authenticates, so it cannot sit behind the gate.
-    for command in COMMANDS:
-        callback = _auth_required(command.handler) if command.gated else command.handler
-        app.add_handler(CommandHandler(command.name, callback))
+    # Each list is registered for what it is: the entry point as-is, everything else
+    # wrapped. Nothing here decides gating — the declaration already did.
+    app.add_handler(CommandHandler(START_CMD.name, START_CMD.handler))
+    for command in AUTH_GATED_CMDS:
+        app.add_handler(CommandHandler(command.name, _auth_required(command.handler)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _auth_required(handle_message)))
 
     return app

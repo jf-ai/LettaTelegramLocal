@@ -223,8 +223,11 @@ class TestCommandRegistry:
     def test_every_command_is_described_for_help(self):
         assert [entry.name for entry in bridge.COMMANDS if not entry.description.strip()] == []
 
-    def test_only_start_is_ungated_in_the_registry(self):
-        assert [entry.name for entry in bridge.COMMANDS if not entry.gated] == ["start"]
+    def test_the_start_command_is_declared_apart_from_the_gated_ones(self):
+        """Structure over flags: the ungated command cannot be inside the gated list."""
+        assert bridge.START_CMD.name == "start"
+        assert bridge.START_CMD not in bridge.AUTH_GATED_CMDS
+        assert bridge.COMMANDS == (bridge.START_CMD,) + bridge.AUTH_GATED_CMDS
 
     def test_help_lists_every_command_with_its_description(self):
         update = _update(bridge.ALLOWED_USER_IDS[0])
